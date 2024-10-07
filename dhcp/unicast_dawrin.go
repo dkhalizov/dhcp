@@ -3,7 +3,6 @@
 package dhcp
 
 import (
-	"dhcp/dhcp/packet"
 	"fmt"
 	"log"
 	"os"
@@ -11,7 +10,7 @@ import (
 	"unsafe"
 )
 
-func (s *Server) Unicast(p *packet.Ethernet) error {
+func (s *Server) Unicast(p *Ethernet) error {
 	intName, err := getInterfaceName()
 	if err != nil {
 		return err
@@ -35,7 +34,7 @@ func (s *Server) Unicast(p *packet.Ethernet) error {
 
 	enableImmediateMode(bpf)
 	p.SourceMAC = iface.HardwareAddr
-	data := packet.Craft(p)
+	data := Craft(p)
 	_, err = syscall.Write(bpf, data)
 	if err != nil {
 		log.Fatalf("Failed to send packet: %v", err)

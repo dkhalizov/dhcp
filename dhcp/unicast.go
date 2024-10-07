@@ -1,6 +1,8 @@
 package dhcp
 
-import "net"
+import (
+	"net"
+)
 
 type Offer struct {
 	ClientMAC net.HardwareAddr
@@ -9,6 +11,6 @@ type Offer struct {
 	Interface string
 }
 
-type Unicast interface {
-	Offer(o *Offer) error
+type Network interface {
+	Unicast(o *Ethernet) error
 }
