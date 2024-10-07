@@ -1,6 +1,7 @@
-package pkg
+package dhcp
 
 import (
+	o "dhcp/dhcp/options"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -26,24 +27,36 @@ type Packet struct {
 	ParsedOptions map[byte][]byte
 }
 
+func (p *Packet) HasOption(option byte) ([]byte, bool) {
+	if v, ok := p.ParsedOptions[option]; ok {
+		return v, true
+	}
+	return nil, false
+}
+
 func (p *Packet) ToOffer(offer net.IP) {
 	p.Op = 2
 	p.YIAddr = offer
-	p.SIAddr = []byte{192, 168, 2, 1}
+	router := []byte{192, 168, 1, 1}
+	dhcpSrv := []byte{192, 168, 1, 1}
+	p.SIAddr = dhcpSrv
 	p.SName = [64]byte{ /* DHCP TEST */ 68, 72, 67, 80, 32, 84, 69, 83, 84}
+	subnet := []byte{255, 255, 255, 0}
+	lease := []byte{0, 1, 81, 128}
+	// DHCP options
 	p.Options = []byte{
-		53, 1, 2, // DHCP Message Type: Offer
-		54, 4, 192, 168, 2, 1, // DHCP Server Identifier
-		51, 4, 0, 0, 0, 60, // IP Address Lease Time
-		1, 4, 255, 255, 255, 0, // Subnet Mask
-		3, 4, 192, 168, 2, 1, // Router
-		6, 4, 192, 168, 2, 1, // DNS
-		255, // End
+		OptionDHCPMessageType, 1, DHCPOFFER,
+		OptionSubnetMask, 4, subnet[0], subnet[1], subnet[2], subnet[3],
+		OptionRouter, 4, router[0], router[1], router[2], router[3],
+		OptionServerIdentifier, 4, dhcpSrv[0], dhcpSrv[1], dhcpSrv[2], dhcpSrv[3],
+		OptionIPAddressLeaseTime, 4, lease[0], lease[1], lease[2], lease[3],
+		OptionDomainNameServer, 4, 192, 168, 2, 1,
+		OptionEnd,
 	}
 }
 
 func (p *Packet) DHCPMessageType() byte {
-	return p.ParsedOptions[53][0]
+	return p.ParsedOptions[OptionDHCPMessageType][0]
 }
 
 func (p *Packet) Print() {
@@ -121,7 +134,7 @@ func decode(data []byte) (*Packet, error) {
 
 	for i := 0; i < len(packet.Options); {
 		optN := packet.Options[i]
-		opt := DHCPOptions[optN]
+		opt := o.DHCPOptions[optN]
 		if opt.Name == "End" {
 			break
 		}
@@ -132,11 +145,13 @@ func decode(data []byte) (*Packet, error) {
 	return packet, nil
 }
 
+var magicCookie = []byte{99, 130, 83, 99}
+
 func getDHCPMessageType(options []byte) string {
 	b := strings.Builder{}
 	for i := 0; i < len(options); {
 		optN := options[i]
-		opt := DHCPOptions[optN]
+		opt := o.DHCPOptions[optN]
 		if opt.Name == "End" {
 			break
 		}
@@ -145,9 +160,9 @@ func getDHCPMessageType(options []byte) string {
 		size := int(options[i+1])
 		for j := 0; j < size; j++ {
 			if optN == 55 {
-				b.WriteString(fmt.Sprintf("%s ", DHCPOptions[options[i+2+j]].Name))
+				b.WriteString(fmt.Sprintf("%s ;", o.DHCPOptions[options[i+2+j]].Name))
 			} else {
-				b.WriteString(fmt.Sprintf("%d ", options[i+2+j]))
+				b.WriteString(fmt.Sprintf("%d ;", options[i+2+j]))
 			}
 		}
 
@@ -157,56 +172,7 @@ func getDHCPMessageType(options []byte) string {
 	return b.String()
 }
 
-// craftIPHeader creates a simplified IP header for IPv4
-func craftIPHeader(bodyLen int) []byte {
-	ipHeader := make([]byte, 20)
-
-	// IP Version and Header Length (IPv4)
-	ipHeader[0] = 0x45
-
-	// Total Length (will be filled later)
-	totalLength := 20 + 8 + bodyLen // IP header + UDP header + DHCP payload
-	binary.BigEndian.PutUint16(ipHeader[2:], uint16(totalLength))
-
-	// Protocol (UDP = 17)
-	ipHeader[9] = 17
-
-	// Source IP
-	ipHeader[12] = 192
-	ipHeader[13] = 168
-	ipHeader[14] = 1
-	ipHeader[15] = 1
-
-	// Destination IP
-	ipHeader[16] = 192
-	ipHeader[17] = 168
-	ipHeader[18] = 1
-	ipHeader[19] = 100
-
-	// IP checksum (can be omitted for simplicity as NICs usually handle this)
-
-	return ipHeader
-}
-
-// craftUDPHeader creates a simplified UDP header for DHCP Offer
-func craftUDPHeader(bodyLen int) []byte {
-	udpHeader := make([]byte, 8)
-
-	// Source port (67 for DHCP server)
-	binary.BigEndian.PutUint16(udpHeader[0:], 67)
-
-	// Destination port (68 for DHCP client)
-	binary.BigEndian.PutUint16(udpHeader[2:], 68)
-
-	// Length (UDP header + DHCP payload)
-	udpLength := 8 + bodyLen
-	binary.BigEndian.PutUint16(udpHeader[4:], uint16(udpLength))
-
-	return udpHeader
-}
-
-// craftDHCPOffer builds a DHCP Offer packet as payload
-func craftDHCPOffer(offer net.IP, server net.IP, client net.HardwareAddr) []byte {
+func craftDHCPAck(requested net.IP, server net.IP, client net.HardwareAddr) []byte {
 	dhcpOffer := make([]byte, 240) // DHCP packet minimum size
 
 	// Message Type: Boot Reply (1 byte)
@@ -222,6 +188,7 @@ func craftDHCPOffer(offer net.IP, server net.IP, client net.HardwareAddr) []byte
 	dhcpOffer[3] = 0x00
 
 	// Transaction ID (4 bytes)
+	//todo from request packet
 	binary.BigEndian.PutUint32(dhcpOffer[4:8], 0x12345678) // Example transaction ID
 
 	// Seconds elapsed (2 bytes)
@@ -230,16 +197,17 @@ func craftDHCPOffer(offer net.IP, server net.IP, client net.HardwareAddr) []byte
 	// Flags (2 bytes)
 	binary.BigEndian.PutUint16(dhcpOffer[10:12], 0x0000)
 
-	// Client IP (4 bytes) - Leave as 0 since it's unassigned
-	binary.BigEndian.PutUint32(dhcpOffer[12:16], 0x00000000)
+	// Client IP (4 bytes)
+	binary.BigEndian.PutUint32(dhcpOffer[12:16], binary.BigEndian.Uint32(requested))
 
-	// Your (Client) IP (4 bytes) - The offered IP
-	binary.BigEndian.PutUint32(dhcpOffer[16:20], binary.BigEndian.Uint32(offer))
+	// Your (Client) IP (4 bytes) - The requested IP
+	binary.BigEndian.PutUint32(dhcpOffer[16:20], binary.BigEndian.Uint32(requested))
 
 	// Server IP (4 bytes) - The DHCP server's IP
 	binary.BigEndian.PutUint32(dhcpOffer[20:24], binary.BigEndian.Uint32(server))
 
 	// Gateway IP (4 bytes) - Set to 0 if not used
+	//todo from request packet
 	binary.BigEndian.PutUint32(dhcpOffer[24:28], 0x00000000)
 
 	// Client MAC address (16 bytes)
@@ -256,20 +224,20 @@ func craftDHCPOffer(offer net.IP, server net.IP, client net.HardwareAddr) []byte
 	}
 
 	// Magic cookie (4 bytes)
-	copy(dhcpOffer[236:240], []byte{99, 130, 83, 99})
-
+	copy(dhcpOffer[236:240], magicCookie)
+	//todo to config
+	subnet := []byte{255, 255, 255, 0}
+	router := []byte{192, 168, 1, 1}
+	dhcpSrv := []byte{192, 168, 1, 1}
+	lease := []byte{0, 1, 81, 128}
 	// DHCP options
 	dhcpOptions := []byte{
-		53, 1, 2, // DHCP Message Type = Offer (53, length 1, type 2)
-		1, 4, 255, 255, 255, 0, // Subnet Mask option (255.255.255.0)
-		3, 4, 192, 168, 1, 1, // Router option (192.168.1.1)
-		54, 4, 192, 168, 1, 1, // DHCP Server Identifier
-		51, 4, 0, 1, 81, 128, // Lease time (24 hours = 86400 seconds)
+		53, 1, DHCPACK, // DHCP Message Type = Offer (53, length 1, type 2)
+		1, 4, subnet[0], subnet[1], subnet[2], subnet[3], // Subnet Mask option (255.255.255.0)
+		3, 4, router[0], router[1], router[2], router[3], // Router option (192.168.1.1)
+		54, 4, dhcpSrv[0], dhcpSrv[1], dhcpSrv[2], dhcpSrv[3], // DHCP Server Identifier
+		51, 4, lease[0], lease[1], lease[2], lease[3], // Lease time (24 hours = 86400 seconds)
 		255, // End option
 	}
-
-	// Add options to DHCP payload
-	dhcpOffer = append(dhcpOffer, dhcpOptions...)
-
-	return dhcpOffer
+	return append(dhcpOffer, dhcpOptions...)
 }

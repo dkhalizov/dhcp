@@ -1,9 +1,9 @@
 //go:build arm64 && darwin
 
-package pkg
+package dhcp
 
 import (
-	"dhcp/pkg/packet"
+	"dhcp/dhcp/packet"
 	"fmt"
 	"log"
 	"os"
@@ -11,7 +11,41 @@ import (
 	"unsafe"
 )
 
-func (s *Server) Offer(o *Offer) error {
+func (s *Server) Unicast(p *packet.Ethernet) error {
+	intName, err := getInterfaceName()
+	if err != nil {
+		return err
+
+	}
+	bpf, err := findAvailableBPF()
+	if err != nil {
+		log.Fatalf("Failed to open BPF device: %v", err)
+	}
+	defer syscall.Close(bpf)
+
+	iface, err := getInterface(intName)
+	if err != nil {
+		log.Fatalf("Failed to get interface: %v", err)
+	}
+
+	err = bindToDevice(bpf, iface.Name)
+	if err != nil {
+		log.Fatalf("Failed to bind to device: %v", err)
+	}
+
+	enableImmediateMode(bpf)
+	p.SourceMAC = iface.HardwareAddr
+	data := packet.Craft(p)
+	_, err = syscall.Write(bpf, data)
+	if err != nil {
+		log.Fatalf("Failed to send packet: %v", err)
+	}
+
+	fmt.Println("DHCP Offer frame sent successfully")
+	return nil
+}
+
+func (s *Server) Ack(o *Offer) error {
 	bpf, err := findAvailableBPF()
 	if err != nil {
 		log.Fatalf("Failed to open BPF device: %v", err)
@@ -29,8 +63,8 @@ func (s *Server) Offer(o *Offer) error {
 	}
 
 	enableImmediateMode(bpf)
-	offer := craftDHCPOffer(o.OfferIP, o.ServerIP, o.ClientMAC)
-	p := &packet.Packet{
+	offer := craftDHCPAck(o.OfferIP, o.ServerIP, o.ClientMAC)
+	p := &packet.Ethernet{
 		SourcePort:      []byte{0, 67},
 		DestinationPort: []byte{0, 68},
 		SourceIP:        o.ServerIP,

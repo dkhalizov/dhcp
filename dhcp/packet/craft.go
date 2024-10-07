@@ -5,7 +5,7 @@ import (
 	"net"
 )
 
-type Packet struct {
+type Ethernet struct {
 	SourcePort, DestinationPort []byte
 	SourceIP, DestinationIP     net.IP
 	SourceMAC, DestinationMAC   net.HardwareAddr
@@ -13,7 +13,7 @@ type Packet struct {
 	Payload []byte
 }
 
-func Craft(p *Packet) []byte {
+func Craft(p *Ethernet) []byte {
 	u := udp{
 		Source:      binary.BigEndian.Uint16(p.SourcePort),
 		Destination: binary.BigEndian.Uint16(p.DestinationPort),

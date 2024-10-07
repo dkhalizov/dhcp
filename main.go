@@ -1,13 +1,13 @@
 package main
 
 import (
-	"dhcp/pkg"
+	"dhcp/dhcp"
 	"net"
 	"time"
 )
 
 func main() {
-	pkg.NewServer(&pkg.Config{
+	dhcp.NewServer(&dhcp.Config{
 		Start: net.IPv4(192, 168, 2, 10),
 		End:   net.IPv4(192, 168, 2, 20),
 		Lease: time.Minute * 10,
