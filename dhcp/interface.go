@@ -3,6 +3,7 @@ package dhcp
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net"
 )
 
@@ -36,10 +37,15 @@ func getInterfaceName() (string, error) {
 }
 
 // getInterface retrieves the network interface by name.
-func getInterface(ifaceName string) (*net.Interface, error) {
+func getInterface() (*net.Interface, error) {
+	ifaceName, err := getInterfaceName()
+	if err != nil {
+		return nil, err
+	}
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("could not get interface: %v", err)
 	}
+	log.Println("Using interface:", iface.Name)
 	return iface, nil
 }

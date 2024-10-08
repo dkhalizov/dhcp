@@ -31,7 +31,7 @@ func (s *Server) Unicast(p *Ethernet) error {
 	}
 	defer syscall.CloseHandle(fd)
 
-	bytes := Craft(p)
+	bytes := p.Bytes()
 	// Prepare the WSABuf
 	var wsaBuf syscall.WSABuf
 	wsaBuf.Len = uint32(len(bytes))

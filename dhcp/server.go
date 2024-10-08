@@ -1,9 +1,9 @@
 package dhcp
 
 import (
-	"dhcp/dhcp/packet"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
 	"time"
 )
@@ -12,14 +12,54 @@ type Server struct {
 	bindings  map[uint64]*binding
 	allocated map[uint64]*binding
 	addrV4    net.IP
+	gateway   net.IP
 	macAddr   net.HardwareAddr
 	config    *Config
+
+	udpConn *net.UDPConn
 }
 
 type Config struct {
-	Start net.IP
-	End   net.IP
-	Lease time.Duration
+	Start   net.IP
+	End     net.IP
+	Lease   time.Duration
+	DNS1    net.IP
+	DNS2    net.IP
+	Name    []byte
+	Subnet  net.IP
+	Addr    net.IP
+	Gateway net.IP
+}
+
+func (c *Config) validate() error {
+	if c.Start == nil {
+		return fmt.Errorf("start address is required")
+	}
+	if c.End == nil {
+		return fmt.Errorf("end address is required")
+	}
+	if c.Lease == 0 {
+		return fmt.Errorf("lease duration is required")
+	}
+	if c.DNS1 == nil {
+		return fmt.Errorf("DNS1 is required")
+	}
+	if c.DNS2 == nil {
+		return fmt.Errorf("DNS2 is required")
+	}
+	if c.Name == nil {
+		return fmt.Errorf("name is required")
+	}
+	if c.Subnet == nil {
+		return fmt.Errorf("subnet is required")
+	}
+	if c.Addr == nil {
+		return fmt.Errorf("addr is required")
+	}
+	if c.Gateway == nil {
+		return fmt.Errorf("gateway is required")
+	}
+	return nil
 }
 
 type binding struct {
@@ -29,19 +69,35 @@ type binding struct {
 }
 
 func NewServer(cfg *Config) *Server {
+	//validate config
+	if err := cfg.validate(); err != nil {
+		log.Fatalf("Invalid config: %v", err)
+	}
+
 	return &Server{
 		bindings:  make(map[uint64]*binding),
 		allocated: make(map[uint64]*binding),
 		config:    cfg,
+		addrV4:    cfg.Addr,
+		gateway:   cfg.Gateway,
 	}
 }
 
 func (s *Server) Run() {
+	log.Println("Starting DHCP server")
+	dial, err := net.Dial("udp", "255.255.255.255:68")
+	if err != nil {
+		log.Fatalf("Failed to dial: %v", err)
+	}
+	s.udpConn = dial.(*net.UDPConn)
+	defer s.udpConn.Close()
+	log.Printf("DHCP server started on %s", s.udpConn.LocalAddr())
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 67})
 	if err != nil {
 		return
 	}
 	defer conn.Close()
+	log.Printf("Listening on %s", conn.LocalAddr())
 	for {
 		data := make([]byte, 1024)
 		_, _, err = conn.ReadFromUDP(data)
@@ -55,7 +111,8 @@ func (s *Server) Run() {
 
 func (s *Server) processRawPacket(data []byte) {
 	p, _ := decode(data)
-	p.Print()
+	//p.Print()
+	log.Printf("Received DHCP %b from %s\n", p.DHCPMessageType(), p.CHAddr)
 	switch p.DHCPMessageType() {
 	case DHCPDISCOVER:
 		bind := s.validateOffer(p)
@@ -64,7 +121,19 @@ func (s *Server) processRawPacket(data []byte) {
 			//send NAK
 			return
 		}
-		p.ToOffer(bind.IP)
+		log.Printf("Offering IP %s to %s\n", bind.IP, p.CHAddr)
+		opt := replyOpt{
+			router:        s.gateway,
+			dhcpSrv:       s.addrV4,
+			sName:         s.config.Name,
+			subnet:        s.config.Subnet,
+			renewTime:     [4]byte{0, 0, 0x0E, 0x10},
+			rebindingTime: [4]byte{0, 0, 0x18, 0x9c},
+			lease:         [4]byte{0, 0, 0x0E, 0x10}, //10 minutes
+			dns:           [8]byte{s.config.DNS1[0], s.config.DNS1[1], s.config.DNS1[2], s.config.DNS1[3], s.config.DNS2[0], s.config.DNS2[1], s.config.DNS2[2], s.config.DNS2[3]},
+		}
+		log.Printf("offering with %v\n", opt)
+		p.ToOffer(bind.IP, &opt)
 		//send OFFER
 		err := s.sendOffer(p, bind.MAC)
 		if err != nil {
@@ -84,6 +153,7 @@ func (s *Server) processRawPacket(data []byte) {
 			// we are not the right server, drop
 			return
 		}
+		// todo change to <<
 		if convertIPToUint64(p.CIAddr) != 0 {
 			//'ciaddr' MUST be zero
 			return
@@ -93,16 +163,28 @@ func (s *Server) processRawPacket(data []byte) {
 			//??
 			return
 		}
+		// todo check and sync
 		s.reserve(addr, p.CHAddr)
 
-		offer := craftDHCPAck(addr, s.addrV4, p.CHAddr)
-		raw := &packet.Ethernet{
+		//todo to config
+		opt := replyOpt{
+			router:        s.addrV4,
+			dhcpSrv:       s.addrV4,
+			sName:         s.config.Name,
+			subnet:        s.config.Subnet,
+			renewTime:     [4]byte{0, 0, 0x0E, 0x10},
+			rebindingTime: [4]byte{0, 0, 0x18, 0x9c},
+			dns:           [8]byte{s.config.DNS1[0], s.config.DNS1[1], s.config.DNS1[2], s.config.DNS1[3], s.config.DNS2[0], s.config.DNS2[1], s.config.DNS2[2], s.config.DNS2[3]},
+		}
+		p.toAck(addr, &opt)
+		ack := p.Encode()
+		raw := &Ethernet{
 			SourcePort:      []byte{0, 67},
 			DestinationPort: []byte{0, 68},
 			SourceIP:        s.addrV4,
 			DestinationIP:   addr,
 			DestinationMAC:  p.CHAddr,
-			Payload:         offer,
+			Payload:         ack,
 		}
 
 		err := s.Unicast(raw)
@@ -169,6 +251,11 @@ func (s *Server) validateOffer(packet *Packet) *binding {
 	}
 	// If no address could be allocated,
 	return nil
+}
+
+func (s *Server) Broadcast(p []byte) error {
+	_, err := s.udpConn.Write(p)
+	return err
 }
 
 func convertMACToUint64(mac net.HardwareAddr) uint64 {

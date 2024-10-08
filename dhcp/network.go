@@ -1,18 +1,18 @@
 package dhcp
 
 import (
-	"dhcp/dhcp/packet"
+	"log"
 	"net"
 )
 
 func (s *Server) sendOffer(p *Packet, mac net.HardwareAddr) error {
-	// if broadcast flag is set, send broadcast
-	//todo implement broadcast
-	//else send unicast
-	//
-	//offer := craftDHCPOffer(p.YIAddr, p.SIAddr, mac)
+	// broadcast flag
+	if p.IsBroadcast() {
+		return s.Broadcast(p.Encode())
+	}
+	log.Printf("Sending DHCP Offer to %s\n", p.YIAddr)
 	offer := p.Encode()
-	raw := &packet.Ethernet{
+	raw := &Ethernet{
 		SourcePort:      []byte{0, 67},
 		DestinationPort: []byte{0, 68},
 		SourceIP:        p.SIAddr,

@@ -11,18 +11,13 @@ import (
 )
 
 func (s *Server) Unicast(p *Ethernet) error {
-	intName, err := getInterfaceName()
-	if err != nil {
-		return err
-
-	}
 	bpf, err := findAvailableBPF()
 	if err != nil {
 		log.Fatalf("Failed to open BPF device: %v", err)
 	}
 	defer syscall.Close(bpf)
 
-	iface, err := getInterface(intName)
+	iface, err := getInterface()
 	if err != nil {
 		log.Fatalf("Failed to get interface: %v", err)
 	}
@@ -34,56 +29,16 @@ func (s *Server) Unicast(p *Ethernet) error {
 
 	enableImmediateMode(bpf)
 	p.SourceMAC = iface.HardwareAddr
-	data := Craft(p)
+	data := p.Bytes()
 	_, err = syscall.Write(bpf, data)
 	if err != nil {
 		log.Fatalf("Failed to send packet: %v", err)
 	}
 
-	fmt.Println("DHCP Offer frame sent successfully")
+	log.Println("DHCP Offer frame sent successfully")
 	return nil
 }
 
-func (s *Server) Ack(o *Offer) error {
-	bpf, err := findAvailableBPF()
-	if err != nil {
-		log.Fatalf("Failed to open BPF device: %v", err)
-	}
-	defer syscall.Close(bpf)
-
-	iface, err := getInterface(o.Interface)
-	if err != nil {
-		log.Fatalf("Failed to get interface: %v", err)
-	}
-
-	err = bindToDevice(bpf, iface.Name)
-	if err != nil {
-		log.Fatalf("Failed to bind to device: %v", err)
-	}
-
-	enableImmediateMode(bpf)
-	offer := craftDHCPAck(o.OfferIP, o.ServerIP, o.ClientMAC)
-	p := &packet.Ethernet{
-		SourcePort:      []byte{0, 67},
-		DestinationPort: []byte{0, 68},
-		SourceIP:        o.ServerIP,
-		DestinationIP:   o.OfferIP,
-		SourceMAC:       iface.HardwareAddr,
-		DestinationMAC:  o.ClientMAC,
-		Payload:         offer,
-	}
-	data := packet.Craft(p)
-
-	_, err = syscall.Write(bpf, data)
-	if err != nil {
-		log.Fatalf("Failed to send packet: %v", err)
-	}
-
-	fmt.Println("DHCP Offer frame sent successfully")
-	return nil
-}
-
-// findAvailableBPF loops through BPF devices and finds the first available one.
 func findAvailableBPF() (int, error) {
 	var bpf int
 	var err error
@@ -100,7 +55,6 @@ func findAvailableBPF() (int, error) {
 	return -1, fmt.Errorf("no available BPF devices found")
 }
 
-// enableImmediateMode enables immediate mode on the BPF device.
 func enableImmediateMode(bpf int) {
 	// Enable immediate mode (BIOCIMMEDIATE)
 	var immediate int = 1
@@ -110,7 +64,6 @@ func enableImmediateMode(bpf int) {
 	}
 }
 
-// bindToDevice binds the BPF file descriptor to a network interface.
 func bindToDevice(bpf int, ifaceName string) error {
 	// Convert interface name to a byte array for system call
 	var ifreq [syscall.IFNAMSIZ]byte
