@@ -49,7 +49,7 @@ func findAvailableBPF() (int, error) {
 			return bpf, nil // Return the first available device
 		}
 		if !os.IsPermission(err) && !os.IsNotExist(err) {
-			log.Printf("Device %s is busy, trying next...", device)
+			slog.Info("Device %s is busy, trying next...", device)
 		}
 	}
 	return -1, fmt.Errorf("no available BPF devices found")

@@ -12,8 +12,7 @@ docker network create --subnet=172.20.0.0/16 $NETWORK_NAME
 
 # Run DHCP server
 echo "Starting DHCP server..."
-docker run -d --name $SERVER_NAME --network $NETWORK_NAME --ip 172.20.0.2 \
-  --cap-add=NET_ADMIN -p 67:67/udp $SERVER_IMAGE
+docker run -d --name $SERVER_NAME --network $NETWORK_NAME --ip 172.20.0.2 --cap-add=NET_ADMIN -p 67:67/udp $SERVER_IMAGE
 
 # Wait for server to start
 echo "Waiting for server to start..."

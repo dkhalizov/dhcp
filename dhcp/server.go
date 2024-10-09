@@ -2,8 +2,10 @@ package dhcp
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"time"
 )
@@ -16,7 +18,8 @@ type Server struct {
 	macAddr   net.HardwareAddr
 	config    *Config
 
-	udpConn *net.UDPConn
+	multicast *net.UDPConn
+	conn      net.PacketConn
 }
 
 type Config struct {
@@ -68,128 +71,107 @@ type binding struct {
 	expiration time.Time
 }
 
+type Offer struct {
+	ClientMAC net.HardwareAddr
+	OfferIP   net.IP
+	ServerIP  net.IP
+}
+
 func NewServer(cfg *Config) *Server {
 	//validate config
 	if err := cfg.validate(); err != nil {
 		log.Fatalf("Invalid config: %v", err)
 	}
 
-	return &Server{
+	s := &Server{
 		bindings:  make(map[uint64]*binding),
 		allocated: make(map[uint64]*binding),
 		config:    cfg,
 		addrV4:    cfg.Addr,
 		gateway:   cfg.Gateway,
 	}
+
+	conn, err := s.buildConn()
+	if err != nil {
+		return nil
+	}
+	s.conn = conn
+	return s
 }
 
 func (s *Server) Run() {
-	log.Println("Starting DHCP server")
+	slog.Info("Starting DHCP server")
+
 	dial, err := net.Dial("udp", "255.255.255.255:68")
 	if err != nil {
 		log.Fatalf("Failed to dial: %v", err)
 	}
-	s.udpConn = dial.(*net.UDPConn)
-	defer s.udpConn.Close()
-	log.Printf("DHCP server started on %s", s.udpConn.LocalAddr())
+	s.multicast = dial.(*net.UDPConn)
+	defer s.multicast.Close()
+	slog.Info("DHCP server started on", "addr", s.multicast.LocalAddr())
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 67})
 	if err != nil {
 		return
 	}
 	defer conn.Close()
-	log.Printf("Listening on %s", conn.LocalAddr())
+	slog.Info("Listening on", "addr", conn.LocalAddr())
 	for {
 		data := make([]byte, 1024)
-		_, _, err = conn.ReadFromUDP(data)
+		n, _, err := conn.ReadFromUDP(data)
 		if err != nil {
 			print(err)
 			return
 		}
-		s.processRawPacket(data)
+
+		go s.processRawPacket(data[:n])
 	}
 }
 
 func (s *Server) processRawPacket(data []byte) {
-	p, _ := decode(data)
-	//p.Print()
-	log.Printf("Received DHCP %b from %s\n", p.DHCPMessageType(), p.CHAddr)
-	switch p.DHCPMessageType() {
+	p, err := Decode(data)
+	if err != nil {
+		slog.Error("failed to decode packet:", "err", err)
+		return
+	}
+	dhcpMessageType := p.DHCPMessageType()
+	slog.Info("received DHCP", "type", dhcpMessageType, "addr", p.CHAddr)
+	switch dhcpMessageType {
 	case DHCPDISCOVER:
-		bind := s.validateOffer(p)
-		if bind == nil {
-			print("No available address")
-			//send NAK
+		if err = s.discover(p); err != nil {
+			slog.Error("Failed to send offer:", "err", err)
 			return
-		}
-		log.Printf("Offering IP %s to %s\n", bind.IP, p.CHAddr)
-		opt := replyOpt{
-			router:        s.gateway,
-			dhcpSrv:       s.addrV4,
-			sName:         s.config.Name,
-			subnet:        s.config.Subnet,
-			renewTime:     [4]byte{0, 0, 0x0E, 0x10},
-			rebindingTime: [4]byte{0, 0, 0x18, 0x9c},
-			lease:         [4]byte{0, 0, 0x0E, 0x10}, //10 minutes
-			dns:           [8]byte{s.config.DNS1[0], s.config.DNS1[1], s.config.DNS1[2], s.config.DNS1[3], s.config.DNS2[0], s.config.DNS2[1], s.config.DNS2[2], s.config.DNS2[3]},
-		}
-		log.Printf("offering with %v\n", opt)
-		p.ToOffer(bind.IP, &opt)
-		//send OFFER
-		err := s.sendOffer(p, bind.MAC)
-		if err != nil {
-			fmt.Printf("Failed to send unicast: %v\n", err)
 		}
 	case DHCPREQUEST:
-		var addr []byte
-		var ok bool
-		if addr, ok = p.HasOption(OptionServerIdentifier); !ok {
-			// INIT-REBOOT
-			// RENEWING
-			// REBINDING
-			return
-		}
-		// SELECTING
-		if !compareIPv4(addr, s.addrV4) {
-			// we are not the right server, drop
-			return
-		}
-		// todo change to <<
-		if convertIPToUint64(p.CIAddr) != 0 {
-			//'ciaddr' MUST be zero
-			return
-		}
-		//
-		if addr, ok = p.HasOption(OptionRequestedIPAddress); !ok {
-			//??
-			return
-		}
-		// todo check and sync
-		s.reserve(addr, p.CHAddr)
+		if err = s.request(p); err != nil {
+			if err != errNak {
+				slog.Error("Failed to send ACK:", "err", err)
+				return
+			}
 
-		//todo to config
-		opt := replyOpt{
-			router:        s.addrV4,
-			dhcpSrv:       s.addrV4,
-			sName:         s.config.Name,
-			subnet:        s.config.Subnet,
-			renewTime:     [4]byte{0, 0, 0x0E, 0x10},
-			rebindingTime: [4]byte{0, 0, 0x18, 0x9c},
-			dns:           [8]byte{s.config.DNS1[0], s.config.DNS1[1], s.config.DNS1[2], s.config.DNS1[3], s.config.DNS2[0], s.config.DNS2[1], s.config.DNS2[2], s.config.DNS2[3]},
-		}
-		p.toAck(addr, &opt)
-		ack := p.Encode()
-		raw := &Ethernet{
-			SourcePort:      []byte{0, 67},
-			DestinationPort: []byte{0, 68},
-			SourceIP:        s.addrV4,
-			DestinationIP:   addr,
-			DestinationMAC:  p.CHAddr,
-			Payload:         ack,
-		}
+			if net.IPv4zero.Equal(p.GIAddr) {
+				//      If 'giaddr' is 0x0 in the DHCPREQUEST message, the client is on
+				//      the same subnet as the server.  The server MUST broadcast the
+				//      DHCPNAK message to the 0xffffffff broadcast address because the
+				//      client may not have a correct network address or subnet mask, and
+				//      the client may not be answering ARP requests.
+			} else {
+				//      If 'giaddr' is set in the DHCPREQUEST message, the client is on a
+				//      different subnet.  The server MUST set the broadcast bit in the
+				//      DHCPNAK, so that the relay agent will broadcast the DHCPNAK to the
+				//      client, because the client may not have a correct network address
+				//      or subnet mask, and the client may not be answering ARP requests.
+				p.SetBroadcast()
+			}
 
-		err := s.Unicast(raw)
-		if err != nil {
-			fmt.Printf("Failed to send unicast: %v\n", err)
+			p.toNak(&replyOpt{
+				dhcpSrv: s.addrV4,
+			})
+			ack := p.Encode()
+			err = s.Broadcast(ack)
+			if err != nil {
+				slog.Error("Failed to send NAK:", "err", err)
+			}
+			return
 		}
 
 	case DHCPDECLINE:
@@ -199,6 +181,126 @@ func (s *Server) processRawPacket(data []byte) {
 	case DHCPINFORM:
 
 	}
+}
+
+var errNak = errors.New("nak")
+
+func (s *Server) request(p *Packet) error {
+	var addr []byte
+	var ok bool
+	if addr, ok = p.HasOption(OptionServerIdentifier); !ok {
+		// INIT-REBOOT
+		//'server identifier' MUST NOT be filled in, 'requested IP address'
+		//      option MUST be filled in with client's notion of its previously
+		//      assigned address. 'ciaddr' MUST be zero. The client is seeking to
+		//      verify a previously allocated, cached configuration. Server SHOULD
+		//      send a DHCPNAK message to the client if the 'requested IP address'
+		//      is incorrect, or is on the wrong network.
+		if addr, ok = p.HasOption(OptionRequestedIPAddress); !ok {
+			if !net.IPv4zero.Equal(p.CIAddr) {
+				//RENWING
+				// 'server identifier' MUST NOT be filled in, 'requested IP address'
+				//      option MUST NOT be filled in, 'ciaddr' MUST be filled in with
+				//      client's IP address. In this situation, the client is completely
+				//      configured, and is trying to extend its lease. This message will
+				//      be unicast, so no relay agents will be involved in its
+				//      transmission.  Because 'giaddr' is therefore not filled in, the
+				//      DHCP server will trust the value in 'ciaddr', and use it when
+				//      replying to the client.
+				if !s.inSubnet(p.CIAddr) {
+					return errNak
+				}
+				//todo
+				//return ask
+			}
+			return errNak
+		}
+		if !s.inSubnet(addr) || !s.inSubnet(p.GIAddr) {
+			// Determining whether a client in the INIT-REBOOT state is on the
+			//      correct network is done by examining the contents of 'giaddr', the
+			//      'requested IP address' option, and a database lookup. If the DHCP
+			//      server detects that the client is on the wrong net (i.e., the
+			//      result of applying the local subnet mask or remote subnet mask (if
+			//      'giaddr' is not zero) to 'requested IP address' option value
+			//      doesn't match reality), then the server SHOULD send a DHCPNAK
+			//      message to the client.
+			return errNak
+		}
+
+		// If the network is correct, then the DHCP server should check if
+		//      the client's notion of its IP address is correct. If not, then the
+		//      server SHOULD send a DHCPNAK message to the client. If the DHCP
+		//      server has no record of this client, then it MUST remain silent,
+		//      and MAY output a warning to the network administrator. This
+		//      behavior is necessary for peaceful coexistence of non-
+		//      communicating DHCP servers on the same wire.
+		//todo check notion
+
+	}
+	// SELECTING
+	slog.Info("Requesting IP", "addr", p.CIAddr.String(), "mac", p.CHAddr.String())
+	if !s.addrV4.Equal(addr) {
+		// we are not the right server, drop
+		return errNak
+	}
+	if !net.IPv4zero.Equal(p.CIAddr) {
+		//'ciaddr' MUST be zero
+		return errNak
+	}
+
+	if addr, ok = p.HasOption(OptionRequestedIPAddress); !ok {
+		//??
+		return errNak
+	}
+	// todo check and sync
+	s.reserve(addr, p.CHAddr)
+
+	opt := s.defaultReplyOpt()
+	opt.AddLease(s.config.Lease)
+
+	p.toAck(addr, opt)
+	ack := p.Encode()
+	raw := &Ethernet{
+		SourcePort:      67,
+		DestinationPort: 68,
+		SourceIP:        s.addrV4,
+		DestinationIP:   addr,
+		DestinationMAC:  p.CHAddr,
+		Payload:         ack,
+	}
+	_, err := s.conn.WriteTo(raw.Bytes(), &net.UDPAddr{IP: addr, Port: 68})
+	return err
+}
+
+func (s *Server) defaultReplyOpt() *replyOpt {
+	return &replyOpt{
+		router:        s.gateway,
+		dhcpSrv:       s.addrV4,
+		sName:         s.config.Name,
+		subnet:        s.config.Subnet,
+		renewTime:     [4]byte{0, 0, 0x0E, 0x10},
+		rebindingTime: [4]byte{0, 0, 0x18, 0x9c},
+		dns:           [8]byte{s.config.DNS1[0], s.config.DNS1[1], s.config.DNS1[2], s.config.DNS1[3], s.config.DNS2[0], s.config.DNS2[1], s.config.DNS2[2], s.config.DNS2[3]},
+	}
+}
+
+func (s *Server) discover(p *Packet) error {
+	bind := s.validateOffer(p)
+	if bind == nil {
+		slog.Debug("No available address")
+		//send NAK
+		return nil
+	}
+	slog.Info("Offering IP", "app", bind.IP, "addr", p.CHAddr.String())
+
+	p.ToOffer(bind.IP, s.defaultReplyOpt())
+	slog.Info("offering with", "packet", p)
+
+	err := s.sendOffer(p)
+	if err != nil {
+		slog.Error("Failed to send unicast:", "err,", err)
+	}
+	return err
 }
 
 func (s *Server) reserve(addr net.IP, mac net.HardwareAddr) {
@@ -254,8 +356,18 @@ func (s *Server) validateOffer(packet *Packet) *binding {
 }
 
 func (s *Server) Broadcast(p []byte) error {
-	_, err := s.udpConn.Write(p)
+	_, err := s.multicast.Write(p)
 	return err
+}
+
+func (s *Server) inSubnet(addr []byte) bool {
+	parsedIP := net.IP(addr)
+	_, ipNet, err := net.ParseCIDR(s.config.Subnet.String())
+	if err != nil {
+		slog.Error("Failed to parse subnet:", "err", err)
+		return false
+	}
+	return ipNet.Contains(parsedIP)
 }
 
 func convertMACToUint64(mac net.HardwareAddr) uint64 {

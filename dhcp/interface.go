@@ -3,7 +3,7 @@ package dhcp
 import (
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 )
 
@@ -46,6 +46,6 @@ func getInterface() (*net.Interface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not get interface: %v", err)
 	}
-	log.Println("Using interface:", iface.Name)
+	slog.Info("Using interface:", "name", iface.Name)
 	return iface, nil
 }
