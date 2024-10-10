@@ -132,5 +132,5 @@ func (s *Server) sendOffer(p *Packet) error {
 		Payload:         offer,
 	}
 
-	return s.Write(raw)
+	return s.Write(raw, &net.UDPAddr{IP: p.YIAddr, Port: 68})
 }

@@ -5,38 +5,17 @@ package dhcp
 import (
 	"fmt"
 	"log"
+	"log/slog"
+	"net"
 	"os"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
-func (s *Server) Unicast(p *Ethernet) error {
-	bpf, err := findAvailableBPF()
-	if err != nil {
-		log.Fatalf("Failed to open BPF device: %v", err)
-	}
-	defer syscall.Close(bpf)
-
-	iface, err := getInterface()
-	if err != nil {
-		log.Fatalf("Failed to get interface: %v", err)
-	}
-
-	err = bindToDevice(bpf, iface.Name)
-	if err != nil {
-		log.Fatalf("Failed to bind to device: %v", err)
-	}
-
-	enableImmediateMode(bpf)
-	p.SourceMAC = iface.HardwareAddr
-	data := p.Bytes()
-	_, err = syscall.Write(bpf, data)
-	if err != nil {
-		log.Fatalf("Failed to send packet: %v", err)
-	}
-
-	log.Println("DHCP Offer frame sent successfully")
-	return nil
+func (s *Server) Write(e *Ethernet, addr net.Addr) error {
+	_, err := s.conn.WriteTo(e.Bytes(), addr)
+	return err
 }
 
 func findAvailableBPF() (int, error) {
@@ -75,4 +54,68 @@ func bindToDevice(bpf int, ifaceName string) error {
 		return fmt.Errorf("failed to bind to device: %v", errno)
 	}
 	return nil
+}
+
+func (s *Server) buildConn() (net.PacketConn, error) {
+	return newBPFPacketConn()
+
+}
+
+func newBPFPacketConn() (net.PacketConn, error) {
+	bpf, err := findAvailableBPF()
+	if err != nil {
+		log.Fatalf("Failed to open BPF device: %v", err)
+	}
+	defer syscall.Close(bpf)
+
+	iface, err := getInterface()
+	if err != nil {
+		log.Fatalf("Failed to get interface: %v", err)
+	}
+
+	err = bindToDevice(bpf, iface.Name)
+	if err != nil {
+		log.Fatalf("Failed to bind to device: %v", err)
+	}
+
+	enableImmediateMode(bpf)
+	slog.Info("Bound to device", "name", iface.Name)
+	return &bpfPacketConn{fd: bpf, name: iface.Name}, nil
+}
+
+type bpfPacketConn struct {
+	fd   int
+	name string
+}
+
+func (b *bpfPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, err := syscall.Read(b.fd, p)
+	if err != nil {
+		return 0, nil, err
+	}
+	return n, nil, nil // BPF doesn't provide source address info
+}
+
+func (b *bpfPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	return syscall.Write(b.fd, p)
+}
+
+func (b *bpfPacketConn) Close() error {
+	return syscall.Close(b.fd)
+}
+
+func (b *bpfPacketConn) LocalAddr() net.Addr {
+	return &net.IPAddr{IP: net.IPv4zero}
+}
+
+func (b *bpfPacketConn) SetDeadline(t time.Time) error {
+	return nil // Not implemented
+}
+
+func (b *bpfPacketConn) SetReadDeadline(t time.Time) error {
+	return nil // Not implemented
+}
+
+func (b *bpfPacketConn) SetWriteDeadline(t time.Time) error {
+	return nil // Not implemented
 }

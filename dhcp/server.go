@@ -2,7 +2,6 @@ package dhcp
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -93,6 +92,7 @@ func NewServer(cfg *Config) *Server {
 
 	conn, err := s.buildConn()
 	if err != nil {
+		log.Fatalf("Failed to build conn: %v", err)
 		return nil
 	}
 	s.conn = conn
@@ -117,17 +117,18 @@ func (s *Server) Run() {
 	slog.Info("Listening on", "addr", conn.LocalAddr())
 	for {
 		data := make([]byte, 1024)
-		n, _, err := conn.ReadFromUDP(data)
+		n, peer, err := conn.ReadFromUDP(data)
 		if err != nil {
 			print(err)
 			return
 		}
+		isUnicast := !peer.IP.Equal(net.IPv4bcast) && !peer.IP.IsMulticast()
 
-		go s.processRawPacket(data[:n])
+		go s.processRawPacket(data[:n], isUnicast)
 	}
 }
 
-func (s *Server) processRawPacket(data []byte) {
+func (s *Server) processRawPacket(data []byte, unicast bool) {
 	p, err := Decode(data)
 	if err != nil {
 		slog.Error("failed to decode packet:", "err", err)
@@ -135,141 +136,148 @@ func (s *Server) processRawPacket(data []byte) {
 	}
 	dhcpMessageType := p.DHCPMessageType()
 	slog.Info("received DHCP", "type", dhcpMessageType, "addr", p.CHAddr)
+	var response *Packet
 	switch dhcpMessageType {
+
 	case DHCPDISCOVER:
 		if err = s.discover(p); err != nil {
 			slog.Error("Failed to send offer:", "err", err)
 			return
 		}
 	case DHCPREQUEST:
-		if err = s.request(p); err != nil {
-			if err != errNak {
-				slog.Error("Failed to send ACK:", "err", err)
-				return
-			}
-
-			if net.IPv4zero.Equal(p.GIAddr) {
-				//      If 'giaddr' is 0x0 in the DHCPREQUEST message, the client is on
-				//      the same subnet as the server.  The server MUST broadcast the
-				//      DHCPNAK message to the 0xffffffff broadcast address because the
-				//      client may not have a correct network address or subnet mask, and
-				//      the client may not be answering ARP requests.
-			} else {
-				//      If 'giaddr' is set in the DHCPREQUEST message, the client is on a
-				//      different subnet.  The server MUST set the broadcast bit in the
-				//      DHCPNAK, so that the relay agent will broadcast the DHCPNAK to the
-				//      client, because the client may not have a correct network address
-				//      or subnet mask, and the client may not be answering ARP requests.
-				p.SetBroadcast()
-			}
-
-			p.toNak(&replyOpt{
-				dhcpSrv: s.addrV4,
-			})
-			ack := p.Encode()
-			err = s.Broadcast(ack)
-			if err != nil {
-				slog.Error("Failed to send NAK:", "err", err)
-			}
-			return
+		response = s.handleRequest(p, unicast)
+	}
+	if response == nil {
+		return
+	}
+	var sendAddr *net.UDPAddr
+	if p.GIAddr.Equal(net.IPv4zero) {
+		// Direct communication with client
+		if response.DHCPMessageType() == DHCPNAK {
+			// NAK should be broadcast
+			sendAddr = &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
+		} else if unicast && !response.CIAddr.Equal(net.IPv4zero) {
+			// Unicast to the newly assigned address
+			sendAddr = &net.UDPAddr{IP: response.CIAddr, Port: 68}
+		} else {
+			// Broadcast
+			sendAddr = &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
 		}
-
-	case DHCPDECLINE:
-
-	case DHCPRELEASE:
-
-	case DHCPINFORM:
-
+	} else {
+		// Communication via relay agent
+		sendAddr = &net.UDPAddr{IP: p.GIAddr, Port: 68}
 	}
-}
-
-var errNak = errors.New("nak")
-
-func (s *Server) request(p *Packet) error {
-	var addr []byte
-	var ok bool
-	if addr, ok = p.HasOption(OptionServerIdentifier); !ok {
-		// INIT-REBOOT
-		//'server identifier' MUST NOT be filled in, 'requested IP address'
-		//      option MUST be filled in with client's notion of its previously
-		//      assigned address. 'ciaddr' MUST be zero. The client is seeking to
-		//      verify a previously allocated, cached configuration. Server SHOULD
-		//      send a DHCPNAK message to the client if the 'requested IP address'
-		//      is incorrect, or is on the wrong network.
-		if addr, ok = p.HasOption(OptionRequestedIPAddress); !ok {
-			if !net.IPv4zero.Equal(p.CIAddr) {
-				//RENWING
-				// 'server identifier' MUST NOT be filled in, 'requested IP address'
-				//      option MUST NOT be filled in, 'ciaddr' MUST be filled in with
-				//      client's IP address. In this situation, the client is completely
-				//      configured, and is trying to extend its lease. This message will
-				//      be unicast, so no relay agents will be involved in its
-				//      transmission.  Because 'giaddr' is therefore not filled in, the
-				//      DHCP server will trust the value in 'ciaddr', and use it when
-				//      replying to the client.
-				if !s.inSubnet(p.CIAddr) {
-					return errNak
-				}
-				//todo
-				//return ask
-			}
-			return errNak
-		}
-		if !s.inSubnet(addr) || !s.inSubnet(p.GIAddr) {
-			// Determining whether a client in the INIT-REBOOT state is on the
-			//      correct network is done by examining the contents of 'giaddr', the
-			//      'requested IP address' option, and a database lookup. If the DHCP
-			//      server detects that the client is on the wrong net (i.e., the
-			//      result of applying the local subnet mask or remote subnet mask (if
-			//      'giaddr' is not zero) to 'requested IP address' option value
-			//      doesn't match reality), then the server SHOULD send a DHCPNAK
-			//      message to the client.
-			return errNak
-		}
-
-		// If the network is correct, then the DHCP server should check if
-		//      the client's notion of its IP address is correct. If not, then the
-		//      server SHOULD send a DHCPNAK message to the client. If the DHCP
-		//      server has no record of this client, then it MUST remain silent,
-		//      and MAY output a warning to the network administrator. This
-		//      behavior is necessary for peaceful coexistence of non-
-		//      communicating DHCP servers on the same wire.
-		//todo check notion
-
-	}
-	// SELECTING
-	slog.Info("Requesting IP", "addr", p.CIAddr.String(), "mac", p.CHAddr.String())
-	if !s.addrV4.Equal(addr) {
-		// we are not the right server, drop
-		return errNak
-	}
-	if !net.IPv4zero.Equal(p.CIAddr) {
-		//'ciaddr' MUST be zero
-		return errNak
-	}
-
-	if addr, ok = p.HasOption(OptionRequestedIPAddress); !ok {
-		//??
-		return errNak
-	}
-	// todo check and sync
-	s.reserve(addr, p.CHAddr)
-
-	opt := s.defaultReplyOpt()
-	opt.AddLease(s.config.Lease)
-
-	p.toAck(addr, opt)
-	ack := p.Encode()
+	payload := response.Encode()
 	raw := &Ethernet{
 		SourcePort:      67,
 		DestinationPort: 68,
 		SourceIP:        s.addrV4,
-		DestinationIP:   addr,
+		DestinationIP:   sendAddr.IP,
 		DestinationMAC:  p.CHAddr,
-		Payload:         ack,
+		Payload:         payload,
 	}
-	_, err := s.conn.WriteTo(raw.Bytes(), &net.UDPAddr{IP: addr, Port: 68})
-	return err
+	err = s.Write(raw, sendAddr)
+	if err != nil {
+		slog.Error("Failed to send response:", "err", err)
+	}
+}
+
+func (s *Server) nakOpts() *replyOpt {
+	return &replyOpt{
+		dhcpSrv: s.addrV4,
+	}
+}
+
+func (s *Server) handleRequest(packet *Packet, unicast bool) *Packet {
+	serverIdentifier := packet.ParsedOptions[OptionServerIdentifier]
+	requestedIP := packet.ParsedOptions[OptionRequestedIPAddress]
+	ciaddr := packet.CIAddr
+
+	// SELECTING state
+	if serverIdentifier != nil {
+		slog.Info("Requesting IP", "addr", ciaddr.String(), "mac", packet.CHAddr)
+		if !net.IP(serverIdentifier).Equal(s.config.Addr) {
+			// Request not for this server
+			return nil
+		}
+		if requestedIP == nil {
+			packet.toNak(s.nakOpts())
+			return packet
+		}
+		return s.handleSelectingRequest(packet, requestedIP)
+	}
+
+	// INIT-REBOOT state
+	if requestedIP != nil && ciaddr.Equal(net.IPv4zero) {
+		return s.handleInitRebootRequest(packet, requestedIP)
+	}
+
+	// RENEWING state
+	if requestedIP == nil && !ciaddr.Equal(net.IPv4zero) && unicast {
+		return s.handleRenewingRequest(packet, ciaddr)
+	}
+
+	// REBINDING state
+	if requestedIP == nil && !ciaddr.Equal(net.IPv4zero) && !unicast {
+		return s.handleRebindingRequest(packet, ciaddr)
+	}
+
+	return nil
+}
+
+func (s *Server) handleSelectingRequest(packet *Packet, requestedIP net.IP) *Packet {
+	//if !s.isIPAvailable(requestedIP) {
+	//	packet.toNak(s.nakOpts())
+	//	return packet
+	//}
+	//
+	//lease := Lease{
+	//	IP:        requestedIP,
+	//	MAC:       packet.ClientMAC,
+	//	ExpiresAt: time.Now().Add(s.leaseTime),
+	//}
+	//s.leases[packet.ClientMAC.String()] = lease
+
+	opt := s.defaultReplyOpt()
+	opt.AddLease(s.config.Lease)
+	packet.toAck(requestedIP, opt)
+
+	return packet
+}
+
+func (s *Server) handleInitRebootRequest(packet *Packet, requestedIP net.IP) *Packet {
+	if !s.inSubnet(requestedIP) {
+		packet.toNak(s.nakOpts())
+		return packet
+	}
+
+	//lease, exists := s.leases[packet.ClientMAC.String()]
+	//if !exists || !lease.IP.Equal(requestedIP) {
+	//	packet.toNak(s.nakOpts())
+	//	return packet
+	//}
+	packet.toAck(requestedIP, s.defaultReplyOpt())
+	return packet
+}
+
+func (s *Server) handleRenewingRequest(packet *Packet, ciaddr net.IP) *Packet {
+	//lease, exists := s.leases[packet.ClientMAC.String()]
+	//if !exists || !lease.IP.Equal(ciaddr) {
+	//	packet.toNak(s.nakOpts())
+	//	return packet
+	//}
+	//
+	//lease.ExpiresAt = time.Now().Add(s.leaseTime)
+	//s.leases[packet.ClientMAC.String()] = lease
+
+	packet.toAck(ciaddr, s.defaultReplyOpt())
+	return packet
+}
+
+func (s *Server) handleRebindingRequest(packet *Packet, ciaddr net.IP) *Packet {
+	// Similar to handleRenewingRequest, but we need to check if this server has authority
+	// In a multi-server setup, you might need additional logic here
+	return s.handleRenewingRequest(packet, ciaddr)
 }
 
 func (s *Server) defaultReplyOpt() *replyOpt {
@@ -362,7 +370,9 @@ func (s *Server) Broadcast(p []byte) error {
 
 func (s *Server) inSubnet(addr []byte) bool {
 	parsedIP := net.IP(addr)
-	_, ipNet, err := net.ParseCIDR(s.config.Subnet.String())
+	mask := net.IPMask(s.config.Subnet.To4())
+	ones, _ := mask.Size()
+	_, ipNet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", s.config.Addr, ones))
 	if err != nil {
 		slog.Error("Failed to parse subnet:", "err", err)
 		return false
@@ -383,13 +393,4 @@ func convertIPToUint64(ip net.IP) uint64 {
 		return 0
 	}
 	return binary.BigEndian.Uint64(append([]byte{0, 0, 0, 0}, ip...))
-}
-
-func compareIPv4(a, b net.IP) bool {
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
