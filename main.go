@@ -2,20 +2,26 @@ package main
 
 import (
 	"dhcp/dhcp"
+	"net"
 	"time"
 )
 
 func main() {
-	server := dhcp.NewServer(&dhcp.Config{
-		Start:   []byte{172, 20, 0, 10},
-		End:     []byte{72, 20, 0, 20},
-		Lease:   time.Minute * 10,
-		DNS1:    []byte{8, 8, 8, 8},
-		DNS2:    []byte{8, 8, 4, 4},
-		Name:    []byte{ /* DHCP TEST */ 68, 72, 67, 80, 32, 84, 69, 83, 84},
-		Subnet:  []byte{255, 255, 0, 0},
-		Addr:    []byte{172, 20, 0, 2},
-		Gateway: []byte{172, 20, 0, 1},
-	})
+	config := dhcp.Config{
+		Start:         net.IP{172, 20, 0, 10},
+		End:           net.IP{172, 20, 0, 20},
+		Subnet:        net.IPNet{IP: net.IP{172, 20, 0, 0}, Mask: net.IPMask{255, 255, 0, 0}},
+		Lease:         10 * time.Minute,
+		RenewalTime:   5 * time.Minute, // 50%
+		RebindingTime: 8 * time.Minute, // 80%
+		DNS:           []net.IP{{8, 8, 8, 8}, {8, 8, 4, 4}},
+		Router:        net.IP{172, 20, 0, 1},
+		ServerIP:      net.IP{172, 20, 0, 2},
+		DomainName:    "DHCP TEST",
+	}
+	server, err := dhcp.NewServer(&config)
+	if err != nil {
+		panic(err)
+	}
 	server.Run()
 }

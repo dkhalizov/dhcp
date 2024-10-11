@@ -7,7 +7,7 @@ import (
 )
 
 func TestClient(t *testing.T) {
-	mac, err := net.ParseMAC("04:ec:d8:40:f8:12")
+	mac, err := net.ParseMAC("4a:f3:f1:30:cd:d6")
 	if err != nil {
 		fmt.Println("Error parsing MAC address:", err)
 		return

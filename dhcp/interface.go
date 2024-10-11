@@ -36,7 +36,6 @@ func getInterfaceName() (string, error) {
 	return "", errors.New("no suitable network interface found")
 }
 
-// getInterface retrieves the network interface by name.
 func getInterface() (*net.Interface, error) {
 	ifaceName, err := getInterfaceName()
 	if err != nil {
@@ -48,4 +47,12 @@ func getInterface() (*net.Interface, error) {
 	}
 	slog.Info("Using interface:", "name", iface.Name)
 	return iface, nil
+}
+
+func getMTU() (int, error) {
+	iface, err := getInterface()
+	if err != nil {
+		return 0, err
+	}
+	return iface.MTU, nil
 }

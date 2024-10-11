@@ -55,14 +55,12 @@ func NewWinPacketConn() (*WinPacketConn, error) {
 		return nil, err
 	}
 
-	// Set SO_BROADCAST
 	_, _, err = procSetsockopt.Call(fd, syscall.SOL_SOCKET, syscall.SO_BROADCAST, uintptr(unsafe.Pointer(&[]byte{1}[0])), 1)
 	if err != nil && err != syscall.Errno(0) {
 		syscall.CloseHandle(syscall.Handle(fd))
 		return nil, err
 	}
 
-	// Set SO_REUSEADDR
 	_, _, err = procSetsockopt.Call(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, uintptr(unsafe.Pointer(&[]byte{1}[0])), 1)
 	if err != nil && err != syscall.Errno(0) {
 		syscall.CloseHandle(syscall.Handle(fd))

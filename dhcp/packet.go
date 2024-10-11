@@ -6,33 +6,29 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"time"
+)
+
+const (
+	BOOTREQUEST = 1
+	BOOTREPLY   = 2
 )
 
 type Packet struct {
-	Op            byte
-	HType         byte
-	HLen          byte
-	Hops          byte
-	XID           uint32
-	Secs          uint16
-	Flags         uint16
-	CIAddr        net.IP
-	YIAddr        net.IP
-	SIAddr        net.IP
-	GIAddr        net.IP
-	CHAddr        net.HardwareAddr
-	SName         []byte
-	File          []byte
-	Options       []byte
-	ParsedOptions map[byte][]byte
-}
-
-func (p *Packet) HasOption(option byte) ([]byte, bool) {
-	if v, ok := p.ParsedOptions[option]; ok {
-		return v, true
-	}
-	return nil, false
+	Op      byte
+	HType   byte
+	HLen    byte
+	Hops    byte
+	XId     uint32
+	Secs    uint16
+	Flags   uint16
+	CIAddr  net.IP
+	YIAddr  net.IP
+	SIAddr  net.IP
+	GIAddr  net.IP
+	CHAddr  net.HardwareAddr
+	SName   []byte
+	File    []byte
+	Options []byte
 }
 
 func (p *Packet) IsBroadcast() bool {
@@ -43,28 +39,97 @@ func (p *Packet) SetBroadcast() {
 	p.Flags |= 0x8000
 }
 
-func (p *Packet) ToOffer(offer net.IP, opt *replyOpt) {
-	p.Op = 2
-	p.YIAddr = offer
-	p.SIAddr = opt.dhcpSrv
-	p.SName = opt.sName
+func (p *Packet) ToOffer(offerIP net.IP, options *ReplyOptions) *Packet {
+	offer := &Packet{
+		Op:     BOOTREPLY,
+		HType:  p.HType,
+		HLen:   p.HLen,
+		Hops:   0,
+		XId:    p.XId,
+		Secs:   0,
+		Flags:  p.Flags,
+		CIAddr: net.IPv4zero,
+		YIAddr: offerIP,
+		SIAddr: options.ServerIP,
+		GIAddr: p.GIAddr,
+		CHAddr: p.CHAddr,
+	}
 
-	p.Options = []byte{
-		OptionDHCPMessageType, 1, DHCPOFFER,
-		OptionSubnetMask, byte(len(opt.subnet)), opt.subnet[0], opt.subnet[1], opt.subnet[2], opt.subnet[3],
-		OptionRouter, byte(len(opt.router)), opt.router[0], opt.router[1], opt.router[2], opt.router[3],
-		OptionServerIdentifier, byte(len(opt.dhcpSrv)), opt.dhcpSrv[0], opt.dhcpSrv[1], opt.dhcpSrv[2], opt.dhcpSrv[3],
-		OptionIPAddressLeaseTime, byte(len(opt.lease)), opt.lease[0], opt.lease[1], opt.lease[2], opt.lease[3],
-		OptionDomainNameServer, byte(len(opt.dns)), opt.dns[0], opt.dns[1], opt.dns[2], opt.dns[3], opt.dns[4], opt.dns[5], opt.dns[6], opt.dns[7],
-		OptionEnd,
+	offer.AddOption(OptionDHCPMessageType, []byte{DHCPOFFER})
+	offer.addCommonOptions(options)
+
+	return offer
+}
+
+func (p *Packet) ToAck(ackIP net.IP, options *ReplyOptions) *Packet {
+	ack := &Packet{
+		Op:     BOOTREPLY,
+		HType:  p.HType,
+		HLen:   p.HLen,
+		Hops:   0,
+		XId:    p.XId,
+		Secs:   0,
+		Flags:  p.Flags,
+		CIAddr: p.CIAddr,
+		YIAddr: ackIP,
+		SIAddr: options.ServerIP,
+		GIAddr: p.GIAddr,
+		CHAddr: p.CHAddr,
+	}
+
+	ack.AddOption(OptionDHCPMessageType, []byte{DHCPACK})
+	ack.addCommonOptions(options)
+
+	return ack
+}
+
+func (p *Packet) ToNak(options *ReplyOptions) *Packet {
+	nak := &Packet{
+		Op:     BOOTREPLY,
+		HType:  p.HType,
+		HLen:   p.HLen,
+		Hops:   0,
+		XId:    p.XId,
+		Secs:   0,
+		Flags:  p.Flags,
+		CIAddr: net.IPv4zero,
+		YIAddr: net.IPv4zero,
+		SIAddr: options.ServerIP,
+		GIAddr: p.GIAddr,
+		CHAddr: p.CHAddr,
+	}
+
+	nak.AddOption(OptionDHCPMessageType, []byte{DHCPNAK})
+	nak.AddOption(OptionServerIdentifier, options.ServerIP.To4()) // Server Identifier
+
+	return nak
+}
+
+func (p *Packet) addCommonOptions(options *ReplyOptions) {
+	p.AddOption(OptionSubnetMask, options.SubnetMask)
+	p.AddOption(OptionRouter, options.Router.To4())
+	p.AddOption(OptionDomainNameServer, flattenIPs(options.DNS))
+	p.AddOption(OptionIPAddressLeaseTime, intToBytes(uint32(options.LeaseTime.Seconds())))
+	p.AddOption(OptionServerIdentifier, options.ServerIP.To4())
+	p.AddOption(OptionRenewalTime, intToBytes(uint32(options.RenewalTime.Seconds())))
+	p.AddOption(OptionRebindingTime, intToBytes(uint32(options.RebindingTime.Seconds())))
+	if options.DomainName != "" {
+		p.AddOption(OptionDomainName, []byte(options.DomainName))
 	}
 }
 
-func (p *Packet) DHCPMessageType() byte {
-	if v, ok := p.ParsedOptions[OptionDHCPMessageType]; ok {
-		return v[0]
+func flattenIPs(ips []net.IP) []byte {
+	result := make([]byte, 0, len(ips)*4)
+	for _, ip := range ips {
+		result = append(result, ip.To4()...)
 	}
-	return 0
+	return result
+}
+
+func intToBytes(i uint32) []byte {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, i)
+	return b
 }
 
 func (p *Packet) Print() {
@@ -72,7 +137,7 @@ func (p *Packet) Print() {
 	fmt.Printf("Hardware Type: %d\n", p.HType)
 	fmt.Printf("Hardware Address Length: %d\n", p.HLen)
 	fmt.Printf("Hops: %d\n", p.Hops)
-	fmt.Printf("Transaction ID: %d\n", p.XID)
+	fmt.Printf("Transaction ID: %d\n", p.XId)
 	fmt.Printf("Seconds: %d\n", p.Secs)
 	fmt.Printf("Flags: %d\n", p.Flags)
 	fmt.Printf("Client IP Address: %s\n", p.CIAddr)
@@ -91,7 +156,7 @@ func (p *Packet) Encode() []byte {
 	data[1] = p.HType
 	data[2] = p.HLen
 	data[3] = p.Hops
-	binary.BigEndian.PutUint32(data[4:8], p.XID)
+	binary.BigEndian.PutUint32(data[4:8], p.XId)
 	binary.BigEndian.PutUint16(data[8:10], p.Secs)
 	binary.BigEndian.PutUint16(data[10:12], p.Flags)
 	copy(data[12:16], p.CIAddr.To4())
@@ -103,6 +168,9 @@ func (p *Packet) Encode() []byte {
 	copy(data[108:236], p.File[:])
 	copy(data[236:240], magicCookie)
 	copy(data[240:], p.Options)
+
+	//add end opt
+	data = append(data, 255)
 	return data
 }
 
@@ -112,32 +180,21 @@ func Decode(data []byte) (*Packet, error) {
 	}
 
 	packet := &Packet{
-		Op:            data[0],
-		HType:         data[1],
-		HLen:          data[2],
-		Hops:          data[3],
-		XID:           binary.BigEndian.Uint32(data[4:8]),
-		Secs:          binary.BigEndian.Uint16(data[8:10]),
-		Flags:         binary.BigEndian.Uint16(data[10:12]),
-		CIAddr:        net.IP(data[12:16]),
-		YIAddr:        net.IP(data[16:20]),
-		SIAddr:        net.IP(data[20:24]),
-		GIAddr:        net.IP(data[24:28]),
-		CHAddr:        data[28:44],
-		SName:         data[44:108],
-		File:          data[108:236],
-		Options:       data[240:],
-		ParsedOptions: make(map[byte][]byte),
-	}
-
-	for i := 0; i < len(packet.Options); {
-		optN := packet.Options[i]
-		if optN == 255 {
-			break
-		}
-		size := int(packet.Options[i+1])
-		packet.ParsedOptions[optN] = packet.Options[i+2 : i+2+size]
-		i += size + 2
+		Op:      data[0],
+		HType:   data[1],
+		HLen:    data[2],
+		Hops:    data[3],
+		XId:     binary.BigEndian.Uint32(data[4:8]),
+		Secs:    binary.BigEndian.Uint16(data[8:10]),
+		Flags:   binary.BigEndian.Uint16(data[10:12]),
+		CIAddr:  net.IP(data[12:16]),
+		YIAddr:  net.IP(data[16:20]),
+		SIAddr:  net.IP(data[20:24]),
+		GIAddr:  net.IP(data[24:28]),
+		CHAddr:  data[28:44],
+		SName:   data[44:108],
+		File:    data[108:236],
+		Options: data[240:],
 	}
 	return packet, nil
 }
@@ -169,47 +226,26 @@ func getDHCPMessageType(options []byte) string {
 	return b.String()
 }
 
-type replyOpt struct {
-	router        []byte
-	dhcpSrv       []byte
-	sName         []byte
-	subnet        []byte
-	lease         [4]byte
-	renewTime     [4]byte
-	rebindingTime [4]byte
-	dns           [8]byte
+func (p *Packet) AddOption(code byte, data []byte) {
+	p.Options = append(p.Options, code, byte(len(data)))
+	p.Options = append(p.Options, data...)
 }
 
-func (r *replyOpt) AddLease(lease time.Duration) {
-	binary.BigEndian.PutUint32(r.lease[:], uint32(lease.Seconds()))
-}
-
-func (p *Packet) toAck(offer net.IP, opt *replyOpt) {
-	p.Op = 2
-	p.YIAddr = offer
-	p.SIAddr = opt.dhcpSrv
-	p.SName = opt.sName
-
-	//lease MUST (DHCPREQUEST) MUST NOT (DHCPINFORM) todo
-	// DHCP options
-	p.Options = []byte{
-		OptionDHCPMessageType, 1, DHCPACK,
-		OptionSubnetMask, 4, opt.subnet[0], opt.subnet[1], opt.subnet[2], opt.subnet[3],
-		OptionRouter, 4, opt.router[0], opt.router[1], opt.router[2], opt.router[3],
-		OptionServerIdentifier, 4, opt.dhcpSrv[0], opt.dhcpSrv[1], opt.dhcpSrv[2], opt.dhcpSrv[3],
-		OptionIPAddressLeaseTime, 4, opt.lease[0], opt.lease[1], opt.lease[2], opt.lease[3],
-		OptionRenewalTime, 4, opt.renewTime[0], opt.renewTime[1], opt.renewTime[2], opt.renewTime[3],
-		OptionRebindingTime, 4, opt.rebindingTime[0], opt.rebindingTime[1], opt.rebindingTime[2], opt.rebindingTime[3],
-		OptionDomainNameServer, 8, opt.dns[0], opt.dns[1], opt.dns[2], opt.dns[3], opt.dns[4], opt.dns[5], opt.dns[6], opt.dns[7],
-		OptionEnd,
+func (p *Packet) GetOption(code byte) []byte {
+	for i := 0; i < len(p.Options); {
+		if p.Options[i] == code {
+			length := int(p.Options[i+1])
+			return p.Options[i+2 : i+2+length]
+		}
+		i += int(p.Options[i+1]) + 2
 	}
+	return nil
 }
 
-func (p *Packet) toNak(opt *replyOpt) {
-	p.Op = 2
-	p.Options = []byte{
-		OptionDHCPMessageType, 1, DHCPNAK,
-		OptionServerIdentifier, 4, opt.dhcpSrv[0], opt.dhcpSrv[1], opt.dhcpSrv[2], opt.dhcpSrv[3],
-		OptionEnd,
+func (p *Packet) DHCPMessageType() byte {
+	t := p.GetOption(53)
+	if len(t) != 1 {
+		return 0
 	}
+	return t[0]
 }

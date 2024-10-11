@@ -1,73 +1,64 @@
 package dhcp
 
 import (
-	"encoding/binary"
-	"fmt"
-	"log"
+	"context"
 	"log/slog"
 	"net"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 )
 
-type Server struct {
-	bindings  map[uint64]*binding
-	allocated map[uint64]*binding
-	addrV4    net.IP
-	gateway   net.IP
-	macAddr   net.HardwareAddr
-	config    *Config
+const (
+	SELECTING = iota
+	INIT_REBOOT
+	RENEWING
+	REBINDING
+)
 
-	multicast *net.UDPConn
-	conn      net.PacketConn
+type Server struct {
+	mu          sync.RWMutex
+	bindings    map[uint64]*binding
+	allocated   map[uint64]bool
+	ipPool      *IPPool
+	config      *Config
+	conn        net.PacketConn
+	wg          sync.WaitGroup
+	processChan chan *input
+	exitChan    chan struct{}
+	mtu         int
+}
+
+type input struct {
+	data []byte
+	addr *net.UDPAddr
 }
 
 type Config struct {
-	Start   net.IP
-	End     net.IP
-	Lease   time.Duration
-	DNS1    net.IP
-	DNS2    net.IP
-	Name    []byte
-	Subnet  net.IP
-	Addr    net.IP
-	Gateway net.IP
+	Start         net.IP
+	End           net.IP
+	Subnet        net.IPNet
+	Lease         time.Duration
+	RenewalTime   time.Duration
+	RebindingTime time.Duration
+	DNS           []net.IP
+	Router        net.IP
+	ServerIP      net.IP
+	DomainName    string
 }
 
 func (c *Config) validate() error {
-	if c.Start == nil {
-		return fmt.Errorf("start address is required")
-	}
-	if c.End == nil {
-		return fmt.Errorf("end address is required")
-	}
-	if c.Lease == 0 {
-		return fmt.Errorf("lease duration is required")
-	}
-	if c.DNS1 == nil {
-		return fmt.Errorf("DNS1 is required")
-	}
-	if c.DNS2 == nil {
-		return fmt.Errorf("DNS2 is required")
-	}
-	if c.Name == nil {
-		return fmt.Errorf("name is required")
-	}
-	if c.Subnet == nil {
-		return fmt.Errorf("subnet is required")
-	}
-	if c.Addr == nil {
-		return fmt.Errorf("addr is required")
-	}
-	if c.Gateway == nil {
-		return fmt.Errorf("gateway is required")
-	}
+	//todo
+
 	return nil
 }
 
 type binding struct {
 	IP         net.IP
 	MAC        net.HardwareAddr
-	expiration time.Time
+	Expiration time.Time
 }
 
 type Offer struct {
@@ -76,315 +67,363 @@ type Offer struct {
 	ServerIP  net.IP
 }
 
-func NewServer(cfg *Config) *Server {
-	//validate config
+func NewServer(cfg *Config) (*Server, error) {
 	if err := cfg.validate(); err != nil {
-		log.Fatalf("Invalid config: %v", err)
+		return nil, err
 	}
-
+	ipPool, err := NewIPPool(cfg.Start, cfg.End)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
-		bindings:  make(map[uint64]*binding),
-		allocated: make(map[uint64]*binding),
-		config:    cfg,
-		addrV4:    cfg.Addr,
-		gateway:   cfg.Gateway,
+		bindings:    make(map[uint64]*binding),
+		allocated:   make(map[uint64]bool),
+		ipPool:      ipPool,
+		config:      cfg,
+		processChan: make(chan *input, 100),
+		exitChan:    make(chan struct{}),
+	}
+	s.mtu, err = getMTU()
+	if err != nil {
+		slog.Error("Error getting MTU", "error", err)
+		//fallback to default
+		s.mtu = 1500
 	}
 
 	conn, err := s.buildConn()
 	if err != nil {
-		log.Fatalf("Failed to build conn: %v", err)
-		return nil
+		return nil, err
 	}
 	s.conn = conn
-	return s
+	return s, nil
 }
 
 func (s *Server) Run() {
-	slog.Info("Starting DHCP server")
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
-	dial, err := net.Dial("udp", "255.255.255.255:68")
-	if err != nil {
-		log.Fatalf("Failed to dial: %v", err)
+	runAsync(&s.wg, s.run)
+
+	select {
+	case <-sig:
+		slog.Info("Received signal, stopping server")
+		s.exitChan <- struct{}{}
+		s.exitChan <- struct{}{}
+		close(s.exitChan)
+		close(s.processChan)
 	}
-	s.multicast = dial.(*net.UDPConn)
-	defer s.multicast.Close()
-	slog.Info("DHCP server started on", "addr", s.multicast.LocalAddr())
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 67})
-	if err != nil {
-		return
+	slog.Info("waiting for all goroutines to finish")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		slog.Info("All goroutines completed")
+	case <-ctx.Done():
+		slog.Error("Timed out waiting for goroutines to complete")
 	}
-	defer conn.Close()
-	slog.Info("Listening on", "addr", conn.LocalAddr())
+
+	slog.Info("Server stopped")
+}
+
+func (s *Server) run() {
+	runAsync(&s.wg, s.processPackets)
+	runAsync(&s.wg, s.cleanupExpiredLeases)
+	runAsync(&s.wg, s.startReadConn)
+}
+
+func runAsync(wg *sync.WaitGroup, f func()) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		f()
+	}()
+}
+
+func (s *Server) startReadConn() {
 	for {
-		data := make([]byte, 1024)
-		n, peer, err := conn.ReadFromUDP(data)
+		select {
+		case <-s.exitChan:
+			slog.Info("Stopping read loop")
+			return
+		default:
+			// Set a read deadline to avoid blocking forever
+			err := s.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			if err != nil {
+				slog.Error("Error setting read deadline", "error", err)
+			}
+
+			buf := make([]byte, s.mtu)
+			n, addr, err := s.conn.ReadFrom(buf)
+			if err != nil {
+				if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+					continue
+				}
+				slog.Error("Error reading packet", "error", err)
+				continue
+			}
+			upeer, ok := addr.(*net.UDPAddr)
+			if !ok {
+				slog.Error("Invalid UDP address", "addr", addr)
+				continue
+			}
+			s.processChan <- &input{data: buf[:n], addr: upeer}
+		}
+	}
+}
+
+func (s *Server) processPackets() {
+	for i := range s.processChan {
+		packet, err := Decode(i.data)
 		if err != nil {
-			print(err)
-			return
+			slog.Error("Error decoding packet", "error", err)
+			continue
 		}
-		isUnicast := !peer.IP.Equal(net.IPv4bcast) && !peer.IP.IsMulticast()
-
-		go s.processRawPacket(data[:n], isUnicast)
+		runAsync(&s.wg, func() {
+			s.handlePacket(packet, i.addr)
+		})
 	}
 }
 
-func (s *Server) processRawPacket(data []byte, unicast bool) {
-	p, err := Decode(data)
-	if err != nil {
-		slog.Error("failed to decode packet:", "err", err)
-		return
-	}
-	dhcpMessageType := p.DHCPMessageType()
-	slog.Info("received DHCP", "type", dhcpMessageType, "addr", p.CHAddr)
-	var response *Packet
-	switch dhcpMessageType {
-
+func (s *Server) handlePacket(packet *Packet, addr *net.UDPAddr) {
+	slog.Info("Received packet", "packet", packet, "addr", addr)
+	switch packet.DHCPMessageType() {
 	case DHCPDISCOVER:
-		if err = s.discover(p); err != nil {
-			slog.Error("Failed to send offer:", "err", err)
-			return
-		}
+		s.handleDiscover(packet, addr)
 	case DHCPREQUEST:
-		response = s.handleRequest(p, unicast)
+		s.handleRequest(packet, addr)
+	case DHCPRELEASE:
+		s.handleRelease(packet)
+	case DHCPDECLINE:
+		s.handleDecline(packet)
 	}
-	if response == nil {
+}
+
+func (s *Server) handleDiscover(packet *Packet, addr *net.UDPAddr) {
+	offer := s.createOffer(packet)
+	if offer == nil {
+		slog.Debug("No IP available for offer")
 		return
 	}
-	var sendAddr *net.UDPAddr
-	if p.GIAddr.Equal(net.IPv4zero) {
-		// Direct communication with client
-		if response.DHCPMessageType() == DHCPNAK {
-			// NAK should be broadcast
-			sendAddr = &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
-		} else if unicast && !response.CIAddr.Equal(net.IPv4zero) {
-			// Unicast to the newly assigned address
-			sendAddr = &net.UDPAddr{IP: response.CIAddr, Port: 68}
-		} else {
-			// Broadcast
-			sendAddr = &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
-		}
-	} else {
-		// Communication via relay agent
-		sendAddr = &net.UDPAddr{IP: p.GIAddr, Port: 68}
-	}
-	payload := response.Encode()
-	raw := &Ethernet{
-		SourcePort:      67,
-		DestinationPort: 68,
-		SourceIP:        s.addrV4,
-		DestinationIP:   sendAddr.IP,
-		DestinationMAC:  p.CHAddr,
-		Payload:         payload,
-	}
-	err = s.Write(raw, sendAddr)
+	err := s.sendPacket(offer, addr)
 	if err != nil {
-		slog.Error("Failed to send response:", "err", err)
+		slog.Error("Error sending offer", "error", err)
 	}
 }
 
-func (s *Server) nakOpts() *replyOpt {
-	return &replyOpt{
-		dhcpSrv: s.addrV4,
-	}
-}
+func (s *Server) createOffer(packet *Packet) *Packet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-func (s *Server) handleRequest(packet *Packet, unicast bool) *Packet {
-	serverIdentifier := packet.ParsedOptions[OptionServerIdentifier]
-	requestedIP := packet.ParsedOptions[OptionRequestedIPAddress]
-	ciaddr := packet.CIAddr
-
-	// SELECTING state
-	if serverIdentifier != nil {
-		slog.Info("Requesting IP", "addr", ciaddr.String(), "mac", packet.CHAddr)
-		if !net.IP(serverIdentifier).Equal(s.config.Addr) {
-			// Request not for this server
-			return nil
-		}
-		if requestedIP == nil {
-			packet.toNak(s.nakOpts())
-			return packet
-		}
-		return s.handleSelectingRequest(packet, requestedIP)
-	}
-
-	// INIT-REBOOT state
-	if requestedIP != nil && ciaddr.Equal(net.IPv4zero) {
-		return s.handleInitRebootRequest(packet, requestedIP)
-	}
-
-	// RENEWING state
-	if requestedIP == nil && !ciaddr.Equal(net.IPv4zero) && unicast {
-		return s.handleRenewingRequest(packet, ciaddr)
-	}
-
-	// REBINDING state
-	if requestedIP == nil && !ciaddr.Equal(net.IPv4zero) && !unicast {
-		return s.handleRebindingRequest(packet, ciaddr)
-	}
-
-	return nil
-}
-
-func (s *Server) handleSelectingRequest(packet *Packet, requestedIP net.IP) *Packet {
-	//if !s.isIPAvailable(requestedIP) {
-	//	packet.toNak(s.nakOpts())
-	//	return packet
-	//}
-	//
-	//lease := Lease{
-	//	IP:        requestedIP,
-	//	MAC:       packet.ClientMAC,
-	//	ExpiresAt: time.Now().Add(s.leaseTime),
-	//}
-	//s.leases[packet.ClientMAC.String()] = lease
-
-	opt := s.defaultReplyOpt()
-	opt.AddLease(s.config.Lease)
-	packet.toAck(requestedIP, opt)
-
-	return packet
-}
-
-func (s *Server) handleInitRebootRequest(packet *Packet, requestedIP net.IP) *Packet {
-	if !s.inSubnet(requestedIP) {
-		packet.toNak(s.nakOpts())
-		return packet
-	}
-
-	//lease, exists := s.leases[packet.ClientMAC.String()]
-	//if !exists || !lease.IP.Equal(requestedIP) {
-	//	packet.toNak(s.nakOpts())
-	//	return packet
-	//}
-	packet.toAck(requestedIP, s.defaultReplyOpt())
-	return packet
-}
-
-func (s *Server) handleRenewingRequest(packet *Packet, ciaddr net.IP) *Packet {
-	//lease, exists := s.leases[packet.ClientMAC.String()]
-	//if !exists || !lease.IP.Equal(ciaddr) {
-	//	packet.toNak(s.nakOpts())
-	//	return packet
-	//}
-	//
-	//lease.ExpiresAt = time.Now().Add(s.leaseTime)
-	//s.leases[packet.ClientMAC.String()] = lease
-
-	packet.toAck(ciaddr, s.defaultReplyOpt())
-	return packet
-}
-
-func (s *Server) handleRebindingRequest(packet *Packet, ciaddr net.IP) *Packet {
-	// Similar to handleRenewingRequest, but we need to check if this server has authority
-	// In a multi-server setup, you might need additional logic here
-	return s.handleRenewingRequest(packet, ciaddr)
-}
-
-func (s *Server) defaultReplyOpt() *replyOpt {
-	return &replyOpt{
-		router:        s.gateway,
-		dhcpSrv:       s.addrV4,
-		sName:         s.config.Name,
-		subnet:        s.config.Subnet,
-		renewTime:     [4]byte{0, 0, 0x0E, 0x10},
-		rebindingTime: [4]byte{0, 0, 0x18, 0x9c},
-		dns:           [8]byte{s.config.DNS1[0], s.config.DNS1[1], s.config.DNS1[2], s.config.DNS1[3], s.config.DNS2[0], s.config.DNS2[1], s.config.DNS2[2], s.config.DNS2[3]},
-	}
-}
-
-func (s *Server) discover(p *Packet) error {
-	bind := s.validateOffer(p)
-	if bind == nil {
-		slog.Debug("No available address")
-		//send NAK
+	ip := s.ipPool.allocate()
+	if ip == nil {
 		return nil
 	}
-	slog.Info("Offering IP", "app", bind.IP, "addr", p.CHAddr.String())
+	slog.Info("Allocated IP", "ip", ip)
+	offer := packet.ToOffer(ip, s.createReplyOptions())
+	s.bindings[convertMACToUint64(packet.CHAddr)] = &binding{
+		IP:         ip,
+		MAC:        packet.CHAddr,
+		Expiration: time.Now().Add(s.config.Lease),
+	}
+	s.allocated[convertIPToUint64(ip)] = true
+	slog.Info("Offering IP", "app", ip, "addr", packet.CHAddr.String())
+	return offer
+}
 
-	p.ToOffer(bind.IP, s.defaultReplyOpt())
-	slog.Info("offering with", "packet", p)
+func (s *Server) handleRelease(packet *Packet) {
+	s.releaseIP(packet.CIAddr)
+}
 
-	err := s.sendOffer(p)
+func (s *Server) handleDecline(packet *Packet) {
+	s.releaseIP(packet.CIAddr)
+}
+
+func (s *Server) releaseIP(ip net.IP) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ipUint := convertIPToUint64(ip)
+	if _, exists := s.allocated[ipUint]; exists {
+		delete(s.allocated, ipUint)
+		s.ipPool.release(ip)
+	}
+
+	for mac, b := range s.bindings {
+		if b.IP.Equal(ip) {
+			delete(s.bindings, mac)
+			break
+		}
+	}
+}
+
+func (s *Server) setupListener() (*net.UDPConn, error) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 67})
 	if err != nil {
-		slog.Error("Failed to send unicast:", "err,", err)
+		return nil, err
 	}
-	return err
+	slog.Info("Listening on", "addr", conn.LocalAddr())
+	return conn, nil
 }
 
-func (s *Server) reserve(addr net.IP, mac net.HardwareAddr) {
-	b := binding{
-		IP:         addr,
-		MAC:        mac,
-		expiration: time.Now().Add(time.Hour),
+func (s *Server) cleanupExpiredLeases() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			s.mu.Lock()
+			for mac, b := range s.bindings {
+				if b.Expiration.Before(now) {
+					s.releaseIP(b.IP)
+					delete(s.bindings, mac)
+				}
+			}
+			s.mu.Unlock()
+		case <-s.exitChan:
+			slog.Info("Stopping lease cleanup")
+			return
+		}
 	}
-	s.allocated[convertIPToUint64(addr)] = &b
-	s.bindings[convertMACToUint64(mac)] = &b
 }
 
-func (s *Server) validateOffer(packet *Packet) *binding {
-	now := time.Now()
-	if b, ok := s.bindings[convertMACToUint64(packet.CHAddr)]; ok {
-		// The client's current address as recorded in the client's current
-		//        binding, ELSE
-		if b.expiration.After(now) {
-			return b
-		}
-		b.expiration = now.Add(s.config.Lease)
-		// The client's previous address as recorded in the client's (now
-		// expired or released) binding, if that address is in the server's
-		// pool of available addresses and not already allocated, ELSE
-		if _, ok = s.allocated[convertIPToUint64(b.IP)]; !ok {
-			return b
-		}
-	}
-
-	//      o The address requested in the 'Requested IP Address' option, if that
-	//        address is valid and not already allocated, ELSE
-	if o, ok := packet.ParsedOptions[OptionRequestedIPAddress]; ok {
-		requested := net.IP{o[0], o[1], o[2], o[3]}
-		if _, ok = s.allocated[convertIPToUint64(requested)]; !ok {
-			return &binding{IP: requested, MAC: packet.CHAddr, expiration: now.Add(s.config.Lease)}
-		}
-	}
-
-	//      o A new address allocated from the server's pool of available
-	//        addresses; the address is selected based on the subnet from which
-	//        the message was received (if 'giaddr' is 0) or on the address of
-	//        the relay agent that forwarded the message ('giaddr' when not 0).
-	start := s.config.Start
-	end := s.config.End
-
-	for ip := start; ip[3] <= end[3]; ip[3]++ {
-		if _, ok := s.allocated[convertIPToUint64(ip)]; !ok {
-			return &binding{IP: ip, MAC: packet.CHAddr, expiration: now.Add(s.config.Lease)}
-		}
-	}
-	// If no address could be allocated,
-	return nil
+type ReplyOptions struct {
+	LeaseTime     time.Duration
+	RenewalTime   time.Duration
+	RebindingTime time.Duration
+	SubnetMask    net.IPMask
+	Router        net.IP
+	DNS           []net.IP
+	ServerIP      net.IP
+	DomainName    string
 }
 
-func (s *Server) Broadcast(p []byte) error {
-	_, err := s.multicast.Write(p)
-	return err
+func (s *Server) createReplyOptions() *ReplyOptions {
+	//todo can cache it until config change
+	return &ReplyOptions{
+		LeaseTime:     s.config.Lease,
+		RenewalTime:   s.config.RenewalTime,
+		RebindingTime: s.config.RebindingTime,
+		SubnetMask:    s.config.Subnet.Mask,
+		Router:        s.config.Router,
+		DNS:           s.config.DNS,
+		ServerIP:      s.config.ServerIP,
+		DomainName:    s.config.DomainName,
+	}
 }
 
-func (s *Server) inSubnet(addr []byte) bool {
-	parsedIP := net.IP(addr)
-	mask := net.IPMask(s.config.Subnet.To4())
-	ones, _ := mask.Size()
-	_, ipNet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", s.config.Addr, ones))
+func (s *Server) createAckOrNak(packet *Packet) *Packet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	b, exists := s.bindings[convertMACToUint64(packet.CHAddr)]
+	if !exists || !b.IP.Equal(packet.CIAddr) {
+		slog.Error("Invalid request", "packet", packet)
+		return packet.ToNak(s.createReplyOptions())
+	}
+
+	b.Expiration = time.Now().Add(s.config.Lease)
+	slog.Info("Acknowledging IP", "ip", b.IP)
+	return packet.ToAck(b.IP, s.createReplyOptions())
+}
+
+func (s *Server) handleRequest(packet *Packet, addr *net.UDPAddr) {
+	state := s.determineClientState(packet)
+	var response *Packet
+	switch state {
+	case SELECTING:
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		requestedIP := packet.GetOption(OptionRequestedIPAddress)
+		serverIdentifier := packet.GetOption(OptionServerIdentifier)
+
+		if !net.IP(serverIdentifier).Equal(s.config.ServerIP) {
+			// Client has selected a different server
+			return
+		}
+		response = s.buildResponseToBinding(packet, requestedIP)
+
+	case INIT_REBOOT:
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		requestedIP := packet.GetOption(OptionRequestedIPAddress)
+		response = s.buildResponseToBinding(packet, requestedIP)
+
+	case RENEWING, REBINDING:
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		response = s.buildResponseToBinding(packet, packet.CIAddr)
+
+	default:
+		slog.Error("Invalid DHCPREQUEST state")
+		return
+	}
+	if response == nil {
+		slog.Error("Error creating response")
+		return
+	}
+	err := s.sendPacket(response, addr)
 	if err != nil {
-		slog.Error("Failed to parse subnet:", "err", err)
-		return false
+		slog.Error("Error sending response", "error", err)
 	}
-	return ipNet.Contains(parsedIP)
+}
+
+func (s *Server) buildResponseToBinding(packet *Packet, ip net.IP) (response *Packet) {
+	b, exists := s.bindings[convertMACToUint64(packet.CHAddr)]
+	if !exists || !b.IP.Equal(ip) {
+		response = packet.ToNak(s.createReplyOptions())
+	} else if b.Expiration.Before(time.Now()) {
+		response = packet.ToNak(s.createReplyOptions())
+	} else {
+		b.Expiration = time.Now().Add(s.config.Lease)
+		response = packet.ToAck(b.IP, s.createReplyOptions())
+	}
+	return response
+}
+
+func (s *Server) determineClientState(packet *Packet) int {
+	emptyServer := packet.SIAddr == nil || packet.SIAddr.Equal(net.IPv4zero)
+	hasRequestedIP := packet.GetOption(OptionRequestedIPAddress) != nil && !net.IPv4zero.Equal(packet.GetOption(OptionServerIdentifier))
+	clientIPIsZero := packet.CIAddr.Equal(net.IPv4zero)
+
+	if !emptyServer && hasRequestedIP && clientIPIsZero {
+		return SELECTING
+	}
+
+	if emptyServer && hasRequestedIP && clientIPIsZero {
+		return INIT_REBOOT
+	}
+
+	if emptyServer && !clientIPIsZero {
+		if packet.IsBroadcast() {
+			return REBINDING
+		}
+		return RENEWING
+	}
+	return -1
+}
+
+func ip4ToUint32(ip net.IP) uint32 {
+	ip = ip.To4()
+	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+}
+
+func uint32ToIP4(n uint32) net.IP {
+	return net.IPv4(byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
 }
 
 func convertMACToUint64(mac net.HardwareAddr) uint64 {
-	var macUint64 uint64
-	macBytes := mac[:6] // MAC addresses are 6 bytes long
-	macUint64 = binary.BigEndian.Uint64(append([]byte{0, 0}, macBytes...))
-	return macUint64
+	return uint64(mac[0])<<40 | uint64(mac[1])<<32 | uint64(mac[2])<<24 | uint64(mac[3])<<16 | uint64(mac[4])<<8 | uint64(mac[5])
 }
 
 func convertIPToUint64(ip net.IP) uint64 {
@@ -392,5 +431,5 @@ func convertIPToUint64(ip net.IP) uint64 {
 	if ip == nil {
 		return 0
 	}
-	return binary.BigEndian.Uint64(append([]byte{0, 0, 0, 0}, ip...))
+	return uint64(ip[0])<<24 | uint64(ip[1])<<16 | uint64(ip[2])<<8 | uint64(ip[3])
 }

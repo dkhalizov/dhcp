@@ -15,35 +15,30 @@ const (
 
 func createDHCPPacket(mac net.HardwareAddr, messageType byte, requestIP net.IP, serverIP net.IP) *dhcp.Packet {
 	packet := &dhcp.Packet{
-		Op:     1, // BOOTREQUEST
-		HType:  1, // Ethernet
-		HLen:   6, // MAC address length
+		Op:     1,
+		HType:  1,
+		HLen:   6,
 		Hops:   0,
-		XID:    uint32(time.Now().UnixNano()),
+		XId:    uint32(time.Now().UnixNano()),
 		Secs:   0,
 		Flags:  0,
 		CHAddr: mac,
 	}
 
 	var options []byte
-	// DHCP Message Type (Discover)
 	options = append(options, 53, 1, messageType)
-	// Client Identifier
 	options = append(options, 61, byte(len(mac)+1), 1)
 	options = append(options, mac...)
 	if requestIP != nil {
-		// Request IP Address
 		options = append(options, 50, 4)
 		options = append(options, requestIP.To4()...)
 	}
 	if serverIP != nil {
-		// Server Identifier
 		options = append(options, 54, 4)
 		options = append(options, serverIP.To4()...)
 	}
-	// Parameter Request List
 	options = append(options, 55, 4, 1, 3, 15, 6)
-	options = append(options, 255) // End
+	options = append(options, 255)
 
 	packet.Options = options
 	return packet
@@ -95,8 +90,6 @@ func chooseOffer(offers []*dhcp.Packet) *dhcp.Packet {
 		return nil
 	}
 
-	// For this example, we'll choose the offer with the lowest IP address
-	// You can implement your own selection criteria here
 	chosenOffer := offers[0]
 	for _, offer := range offers[1:] {
 		if bytes.Compare(offer.YIAddr[:], chosenOffer.YIAddr[:]) < 0 {
@@ -108,7 +101,7 @@ func chooseOffer(offers []*dhcp.Packet) *dhcp.Packet {
 
 func getServerIP(packet *dhcp.Packet) net.IP {
 	for i := 0; i < len(packet.Options); i++ {
-		if packet.Options[i] == 54 && i+5 < len(packet.Options) { // Server Identifier option
+		if packet.Options[i] == 54 && i+5 < len(packet.Options) {
 			return net.IP(packet.Options[i+2 : i+6])
 		}
 	}
