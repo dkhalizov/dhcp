@@ -129,6 +129,10 @@ func (s *Server) sendPacket(p *Packet, sendAddr *net.UDPAddr) error {
 		//unicast
 	}
 
+	if sendAddr.IP.IsUnspecified() {
+		sendAddr.IP = net.IPv4bcast
+	}
+
 	encodedPacket := p.Encode()
 	_, err := s.conn.WriteTo(encodedPacket, sendAddr)
 	if err != nil {

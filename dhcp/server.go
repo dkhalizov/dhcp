@@ -187,6 +187,7 @@ func (s *Server) processPackets() {
 			continue
 		}
 		runAsync(&s.wg, func() {
+			slog.Info("Processing packet", "packet", packet, "addr", i.addr)
 			s.handlePacket(packet, i.addr)
 		})
 	}

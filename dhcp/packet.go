@@ -232,7 +232,7 @@ func (p *Packet) AddOption(code byte, data []byte) {
 }
 
 func (p *Packet) GetOption(code byte) []byte {
-	for i := 0; i < len(p.Options); {
+	for i := 0; i < len(p.Options)-1; {
 		if p.Options[i] == code {
 			length := int(p.Options[i+1])
 			return p.Options[i+2 : i+2+length]
