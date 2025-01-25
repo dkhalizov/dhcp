@@ -1,23 +1,24 @@
 //go:build linux
 
-package dhcp
+package transport
 
 import (
+	"dhcp/protocol"
 	"fmt"
 	"net"
 	"os"
 	"syscall"
 )
 
-func (s *Server) Write(e *Ethernet) error {
-	_, err := s.conn.WriteTo(e.Bytes(), &net.UDPAddr{IP: e.DestinationIP, Port: int(e.DestinationPort)})
+func Write(conn net.PacketConn, e *protocol.Ethernet, addr net.Addr) error {
+	_, err := conn.WriteTo(e.Bytes(), addr)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s *Server) buildConn() (net.PacketConn, error) {
+func buildConn() (net.PacketConn, error) {
 	iface, err := getInterface()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get interface: %v", err)

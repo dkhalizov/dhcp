@@ -2,7 +2,7 @@ package client
 
 import (
 	"bytes"
-	"dhcp/dhcp"
+	"dhcp/protocol"
 	"fmt"
 	"net"
 	"time"
@@ -13,8 +13,8 @@ const (
 	clientPort = 68
 )
 
-func createDHCPPacket(mac net.HardwareAddr, messageType byte, requestIP net.IP, serverIP net.IP) *dhcp.Packet {
-	packet := &dhcp.Packet{
+func createDHCPPacket(mac net.HardwareAddr, messageType byte, requestIP net.IP, serverIP net.IP) *protocol.Packet {
+	packet := &protocol.Packet{
 		Op:     1,
 		HType:  1,
 		HLen:   6,
@@ -44,7 +44,7 @@ func createDHCPPacket(mac net.HardwareAddr, messageType byte, requestIP net.IP, 
 	return packet
 }
 
-func sendAndReceiveMultiple(packet *dhcp.Packet, count int) ([]*dhcp.Packet, error) {
+func sendAndReceiveMultiple(packet *protocol.Packet, count int) ([]*protocol.Packet, error) {
 	conn, err := net.ListenPacket("udp4", fmt.Sprintf("0.0.0.0:%d", clientPort))
 	if err != nil {
 		return nil, err
@@ -61,7 +61,7 @@ func sendAndReceiveMultiple(packet *dhcp.Packet, count int) ([]*dhcp.Packet, err
 		return nil, err
 	}
 
-	responses := make([]*dhcp.Packet, 0, count)
+	responses := make([]*protocol.Packet, 0, count)
 	for i := 0; i < count; i++ {
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
@@ -74,7 +74,7 @@ func sendAndReceiveMultiple(packet *dhcp.Packet, count int) ([]*dhcp.Packet, err
 			return nil, err
 		}
 
-		response, err := dhcp.Decode(buf[:n])
+		response, err := protocol.Decode(buf[:n])
 		if err != nil {
 			return nil, err
 		}
@@ -85,7 +85,7 @@ func sendAndReceiveMultiple(packet *dhcp.Packet, count int) ([]*dhcp.Packet, err
 	return responses, nil
 }
 
-func chooseOffer(offers []*dhcp.Packet) *dhcp.Packet {
+func chooseOffer(offers []*protocol.Packet) *protocol.Packet {
 	if len(offers) == 0 {
 		return nil
 	}
@@ -99,7 +99,7 @@ func chooseOffer(offers []*dhcp.Packet) *dhcp.Packet {
 	return chosenOffer
 }
 
-func getServerIP(packet *dhcp.Packet) net.IP {
+func getServerIP(packet *protocol.Packet) net.IP {
 	for i := 0; i < len(packet.Options); i++ {
 		if packet.Options[i] == 54 && i+5 < len(packet.Options) {
 			return net.IP(packet.Options[i+2 : i+6])

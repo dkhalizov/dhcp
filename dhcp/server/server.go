@@ -1,7 +1,12 @@
-package dhcp
+package server
 
 import (
 	"context"
+	"dhcp/pool"
+	"dhcp/protocol"
+	"dhcp/transport"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -16,19 +21,30 @@ const (
 	INIT_REBOOT
 	RENEWING
 	REBINDING
+
+	defaultMTU           = 1500
+	defaultReadTimeout   = 500 * time.Millisecond
+	leaseCleanupInterval = 1 * time.Minute
 )
+
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 1500)
+	},
+}
 
 type Server struct {
 	mu          sync.RWMutex
 	bindings    map[uint64]*binding
-	allocated   map[uint64]bool
-	ipPool      *IPPool
+	allocated   map[uint32]bool
+	ipPool      *pool.IPPool
 	config      *Config
 	conn        net.PacketConn
 	wg          sync.WaitGroup
 	processChan chan *input
-	exitChan    chan struct{}
 	mtu         int
+
+	cachedReplyOptions *protocol.ReplyOptions
 }
 
 type input struct {
@@ -49,9 +65,13 @@ type Config struct {
 	DomainName    string
 }
 
-func (c *Config) validate() error {
-	//todo
-
+func (c *Config) Validate() error {
+	if c.Lease <= 0 {
+		return errors.New("lease duration must be positive")
+	}
+	if !c.Subnet.Contains(c.ServerIP) {
+		return errors.New("server IP must be within subnet")
+	}
 	return nil
 }
 
@@ -68,48 +88,47 @@ type Offer struct {
 }
 
 func NewServer(cfg *Config) (*Server, error) {
-	if err := cfg.validate(); err != nil {
-		return nil, err
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
-	ipPool, err := NewIPPool(cfg.Start, cfg.End)
+
+	ipPool, err := pool.NewIPPool(cfg.Start, cfg.End)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create IP pool: %w", err)
 	}
+
 	s := &Server{
 		bindings:    make(map[uint64]*binding),
-		allocated:   make(map[uint64]bool),
+		allocated:   make(map[uint32]bool),
 		ipPool:      ipPool,
 		config:      cfg,
 		processChan: make(chan *input, 100),
-		exitChan:    make(chan struct{}),
 	}
-	s.mtu, err = getMTU()
+	s.mtu, err = transport.GetMTU()
 	if err != nil {
-		slog.Error("Error getting MTU", "error", err)
-		//fallback to default
-		s.mtu = 1500
+		slog.Error("Error getting MTU, using default", "error", err, "defaultMTU", defaultMTU)
+		s.mtu = defaultMTU
 	}
 
-	conn, err := s.buildConn()
+	conn, err := transport.BuildConn()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to build connection: %w", err)
 	}
 	s.conn = conn
+
 	return s, nil
 }
 
 func (s *Server) Run() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-
-	runAsync(&s.wg, s.run)
+	withCancel, cancelFunc := context.WithCancel(context.Background())
+	runAsync(withCancel, &s.wg, s.run)
 
 	select {
 	case <-sig:
 		slog.Info("Received signal, stopping server")
-		s.exitChan <- struct{}{}
-		s.exitChan <- struct{}{}
-		close(s.exitChan)
+		cancelFunc()
 		close(s.processChan)
 	}
 	slog.Info("waiting for all goroutines to finish")
@@ -133,117 +152,113 @@ func (s *Server) Run() {
 	slog.Info("Server stopped")
 }
 
-func (s *Server) run() {
-	runAsync(&s.wg, s.processPackets)
-	runAsync(&s.wg, s.cleanupExpiredLeases)
-	runAsync(&s.wg, s.startReadConn)
+func (s *Server) run(ctx context.Context) {
+	runAsync(ctx, &s.wg, s.processPackets)
+	runAsync(ctx, &s.wg, s.cleanupExpiredLeases)
+	runAsync(ctx, &s.wg, s.startReadConn)
 }
 
-func runAsync(wg *sync.WaitGroup, f func()) {
+func runAsync(ctx context.Context, wg *sync.WaitGroup, f func(ctx context.Context)) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		f()
+		f(ctx)
 	}()
 }
 
-func (s *Server) startReadConn() {
+func (s *Server) startReadConn(ctx context.Context) {
 	for {
 		select {
-		case <-s.exitChan:
-			slog.Info("Stopping read loop")
+		case <-ctx.Done():
 			return
 		default:
-			// Set a read deadline to avoid blocking forever
-			err := s.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-			if err != nil {
-				slog.Error("Error setting read deadline", "error", err)
-			}
-
-			buf := make([]byte, s.mtu)
+			_ = s.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			buf := bufPool.Get().([]byte)
 			n, addr, err := s.conn.ReadFrom(buf)
 			if err != nil {
-				if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				slog.Error("Error reading packet", "error", err)
-				continue
+				slog.Error("error reading packet:", "error", err)
 			}
+
 			upeer, ok := addr.(*net.UDPAddr)
 			if !ok {
 				slog.Error("Invalid UDP address", "addr", addr)
 				continue
 			}
+
 			s.processChan <- &input{data: buf[:n], addr: upeer}
+			bufPool.Put(buf)
 		}
 	}
 }
 
-func (s *Server) processPackets() {
+func (s *Server) processPackets(ctx context.Context) {
 	for i := range s.processChan {
-		packet, err := Decode(i.data)
+		packet, err := protocol.Decode(i.data)
 		if err != nil {
 			slog.Error("Error decoding packet", "error", err)
 			continue
 		}
-		runAsync(&s.wg, func() {
+		runAsync(ctx, &s.wg, func(ctx context.Context) {
 			slog.Info("Processing packet", "packet", packet, "addr", i.addr)
 			s.handlePacket(packet, i.addr)
 		})
 	}
 }
 
-func (s *Server) handlePacket(packet *Packet, addr *net.UDPAddr) {
+func (s *Server) handlePacket(packet *protocol.Packet, addr *net.UDPAddr) {
 	slog.Info("Received packet", "packet", packet, "addr", addr)
 	switch packet.DHCPMessageType() {
-	case DHCPDISCOVER:
+	case protocol.DHCPDISCOVER:
 		s.handleDiscover(packet, addr)
-	case DHCPREQUEST:
+	case protocol.DHCPREQUEST:
 		s.handleRequest(packet, addr)
-	case DHCPRELEASE:
+	case protocol.DHCPRELEASE:
 		s.handleRelease(packet)
-	case DHCPDECLINE:
+	case protocol.DHCPDECLINE:
 		s.handleDecline(packet)
 	}
 }
 
-func (s *Server) handleDiscover(packet *Packet, addr *net.UDPAddr) {
+func (s *Server) handleDiscover(packet *protocol.Packet, addr *net.UDPAddr) {
 	offer := s.createOffer(packet)
 	if offer == nil {
 		slog.Debug("No IP available for offer")
 		return
 	}
-	err := s.sendPacket(offer, addr)
+	err := protocol.SendPacket(s.conn, offer, addr)
 	if err != nil {
 		slog.Error("Error sending offer", "error", err)
 	}
 }
 
-func (s *Server) createOffer(packet *Packet) *Packet {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	ip := s.ipPool.allocate()
+func (s *Server) createOffer(packet *protocol.Packet) *protocol.Packet {
+	ip := s.ipPool.Allocate()
 	if ip == nil {
 		return nil
 	}
+
 	slog.Info("Allocated IP", "ip", ip)
 	offer := packet.ToOffer(ip, s.createReplyOptions())
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.bindings[convertMACToUint64(packet.CHAddr)] = &binding{
 		IP:         ip,
 		MAC:        packet.CHAddr,
 		Expiration: time.Now().Add(s.config.Lease),
 	}
-	s.allocated[convertIPToUint64(ip)] = true
+	s.allocated[convertIPToUint32(ip)] = true
 	slog.Info("Offering IP", "app", ip, "addr", packet.CHAddr.String())
 	return offer
 }
 
-func (s *Server) handleRelease(packet *Packet) {
+func (s *Server) handleRelease(packet *protocol.Packet) {
 	s.releaseIP(packet.CIAddr)
 }
 
-func (s *Server) handleDecline(packet *Packet) {
+func (s *Server) handleDecline(packet *protocol.Packet) {
 	s.releaseIP(packet.CIAddr)
 }
 
@@ -251,10 +266,10 @@ func (s *Server) releaseIP(ip net.IP) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ipUint := convertIPToUint64(ip)
+	ipUint := convertIPToUint32(ip)
 	if _, exists := s.allocated[ipUint]; exists {
 		delete(s.allocated, ipUint)
-		s.ipPool.release(ip)
+		s.ipPool.Release(ip)
 	}
 
 	for mac, b := range s.bindings {
@@ -274,7 +289,7 @@ func (s *Server) setupListener() (*net.UDPConn, error) {
 	return conn, nil
 }
 
-func (s *Server) cleanupExpiredLeases() {
+func (s *Server) cleanupExpiredLeases(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
@@ -290,27 +305,22 @@ func (s *Server) cleanupExpiredLeases() {
 				}
 			}
 			s.mu.Unlock()
-		case <-s.exitChan:
+		case <-ctx.Done():
 			slog.Info("Stopping lease cleanup")
 			return
 		}
 	}
 }
 
-type ReplyOptions struct {
-	LeaseTime     time.Duration
-	RenewalTime   time.Duration
-	RebindingTime time.Duration
-	SubnetMask    net.IPMask
-	Router        net.IP
-	DNS           []net.IP
-	ServerIP      net.IP
-	DomainName    string
-}
+func (s *Server) createReplyOptions() *protocol.ReplyOptions {
+	s.mu.RLock()
+	if s.cachedReplyOptions != nil {
+		defer s.mu.RUnlock()
+		return s.cachedReplyOptions
+	}
+	s.mu.RUnlock()
 
-func (s *Server) createReplyOptions() *ReplyOptions {
-	//todo can cache it until config change
-	return &ReplyOptions{
+	options := &protocol.ReplyOptions{
 		LeaseTime:     s.config.Lease,
 		RenewalTime:   s.config.RenewalTime,
 		RebindingTime: s.config.RebindingTime,
@@ -320,9 +330,14 @@ func (s *Server) createReplyOptions() *ReplyOptions {
 		ServerIP:      s.config.ServerIP,
 		DomainName:    s.config.DomainName,
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cachedReplyOptions = options
+	return options
 }
 
-func (s *Server) createAckOrNak(packet *Packet) *Packet {
+func (s *Server) createAckOrNak(packet *protocol.Packet) *protocol.Packet {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -337,16 +352,16 @@ func (s *Server) createAckOrNak(packet *Packet) *Packet {
 	return packet.ToAck(b.IP, s.createReplyOptions())
 }
 
-func (s *Server) handleRequest(packet *Packet, addr *net.UDPAddr) {
+func (s *Server) handleRequest(packet *protocol.Packet, addr *net.UDPAddr) {
 	state := s.determineClientState(packet)
-	var response *Packet
+	var response *protocol.Packet
 	switch state {
 	case SELECTING:
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
-		requestedIP := packet.GetOption(OptionRequestedIPAddress)
-		serverIdentifier := packet.GetOption(OptionServerIdentifier)
+		requestedIP := packet.GetOption(protocol.OptionRequestedIPAddress)
+		serverIdentifier := packet.GetOption(protocol.OptionServerIdentifier)
 
 		if !net.IP(serverIdentifier).Equal(s.config.ServerIP) {
 			// Client has selected a different server
@@ -357,7 +372,7 @@ func (s *Server) handleRequest(packet *Packet, addr *net.UDPAddr) {
 	case INIT_REBOOT:
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		requestedIP := packet.GetOption(OptionRequestedIPAddress)
+		requestedIP := packet.GetOption(protocol.OptionRequestedIPAddress)
 		response = s.buildResponseToBinding(packet, requestedIP)
 
 	case RENEWING, REBINDING:
@@ -373,13 +388,13 @@ func (s *Server) handleRequest(packet *Packet, addr *net.UDPAddr) {
 		slog.Error("Error creating response")
 		return
 	}
-	err := s.sendPacket(response, addr)
+	err := protocol.SendPacket(s.conn, response, addr)
 	if err != nil {
 		slog.Error("Error sending response", "error", err)
 	}
 }
 
-func (s *Server) buildResponseToBinding(packet *Packet, ip net.IP) (response *Packet) {
+func (s *Server) buildResponseToBinding(packet *protocol.Packet, ip net.IP) (response *protocol.Packet) {
 	b, exists := s.bindings[convertMACToUint64(packet.CHAddr)]
 	if !exists || !b.IP.Equal(ip) {
 		response = packet.ToNak(s.createReplyOptions())
@@ -392,9 +407,9 @@ func (s *Server) buildResponseToBinding(packet *Packet, ip net.IP) (response *Pa
 	return response
 }
 
-func (s *Server) determineClientState(packet *Packet) int {
+func (s *Server) determineClientState(packet *protocol.Packet) int {
 	emptyServer := packet.SIAddr == nil || packet.SIAddr.Equal(net.IPv4zero)
-	hasRequestedIP := packet.GetOption(OptionRequestedIPAddress) != nil && !net.IPv4zero.Equal(packet.GetOption(OptionServerIdentifier))
+	hasRequestedIP := packet.GetOption(protocol.OptionRequestedIPAddress) != nil && !net.IPv4zero.Equal(packet.GetOption(protocol.OptionServerIdentifier))
 	clientIPIsZero := packet.CIAddr.Equal(net.IPv4zero)
 
 	if !emptyServer && hasRequestedIP && clientIPIsZero {
@@ -414,23 +429,14 @@ func (s *Server) determineClientState(packet *Packet) int {
 	return -1
 }
 
-func ip4ToUint32(ip net.IP) uint32 {
-	ip = ip.To4()
-	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
-}
-
-func uint32ToIP4(n uint32) net.IP {
-	return net.IPv4(byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
-}
-
 func convertMACToUint64(mac net.HardwareAddr) uint64 {
 	return uint64(mac[0])<<40 | uint64(mac[1])<<32 | uint64(mac[2])<<24 | uint64(mac[3])<<16 | uint64(mac[4])<<8 | uint64(mac[5])
 }
 
-func convertIPToUint64(ip net.IP) uint64 {
+func convertIPToUint32(ip net.IP) uint32 {
 	ip = ip.To4()
 	if ip == nil {
 		return 0
 	}
-	return uint64(ip[0])<<24 | uint64(ip[1])<<16 | uint64(ip[2])<<8 | uint64(ip[3])
+	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
 }

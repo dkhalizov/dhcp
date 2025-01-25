@@ -1,17 +1,13 @@
-package dhcp
+package protocol
 
 import (
-	o "dhcp/dhcp/options"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"strings"
 )
 
-const (
-	BOOTREQUEST = 1
-	BOOTREPLY   = 2
-)
+var magicCookie = []byte{99, 130, 83, 99}
 
 type Packet struct {
 	Op      byte
@@ -118,20 +114,6 @@ func (p *Packet) addCommonOptions(options *ReplyOptions) {
 	}
 }
 
-func flattenIPs(ips []net.IP) []byte {
-	result := make([]byte, 0, len(ips)*4)
-	for _, ip := range ips {
-		result = append(result, ip.To4()...)
-	}
-	return result
-}
-
-func intToBytes(i uint32) []byte {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, i)
-	return b
-}
-
 func (p *Packet) Print() {
 	fmt.Printf("Op: %d\n", p.Op)
 	fmt.Printf("Hardware Type: %d\n", p.HType)
@@ -170,7 +152,7 @@ func (p *Packet) Encode() []byte {
 	copy(data[240:], p.Options)
 
 	//add end opt
-	data = append(data, 255)
+	data = append(data, OptionEnd)
 	return data
 }
 
@@ -199,13 +181,11 @@ func Decode(data []byte) (*Packet, error) {
 	return packet, nil
 }
 
-var magicCookie = []byte{99, 130, 83, 99}
-
 func getDHCPMessageType(options []byte) string {
 	b := strings.Builder{}
 	for i := 0; i < len(options); {
 		optN := options[i]
-		opt := o.DHCPOptions[optN]
+		opt := DHCPOptions[optN]
 		if opt.Name == "End" {
 			break
 		}
@@ -213,8 +193,8 @@ func getDHCPMessageType(options []byte) string {
 		b.WriteString(": ")
 		size := int(options[i+1])
 		for j := 0; j < size; j++ {
-			if optN == 55 {
-				b.WriteString(fmt.Sprintf("%s ;", o.DHCPOptions[options[i+2+j]].Name))
+			if optN == OptionParameterRequestList {
+				b.WriteString(fmt.Sprintf("%s ;", DHCPOptions[options[i+2+j]].Name))
 			} else {
 				b.WriteString(fmt.Sprintf("%d ;", options[i+2+j]))
 			}
@@ -243,7 +223,7 @@ func (p *Packet) GetOption(code byte) []byte {
 }
 
 func (p *Packet) DHCPMessageType() byte {
-	t := p.GetOption(53)
+	t := p.GetOption(OptionDHCPMessageType)
 	if len(t) != 1 {
 		return 0
 	}

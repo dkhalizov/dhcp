@@ -1,6 +1,7 @@
-package dhcp
+package server
 
 import (
+	"dhcp/protocol"
 	"fmt"
 	"net"
 	"testing"
@@ -40,11 +41,11 @@ func (m *mockConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (m *mockConn) sentPacket() *Packet {
+func (m *mockConn) sentPacket() *protocol.Packet {
 	if m.p == nil {
 		return nil
 	}
-	decode, _ := Decode(m.p)
+	decode, _ := protocol.Decode(m.p)
 	return decode
 }
 
@@ -64,20 +65,20 @@ func TestHandleRequest(t *testing.T) {
 
 	mockAddr := &net.UDPAddr{IP: net.ParseIP("192.168.1.5"), Port: 68}
 
-	createPacket := func(messageType byte, clientIP net.IP, requestedIP net.IP, serverIP net.IP) *Packet {
+	createPacket := func(messageType byte, clientIP net.IP, requestedIP net.IP, serverIP net.IP) *protocol.Packet {
 		options := []byte{
-			OptionDHCPMessageType, 1, messageType,
+			protocol.OptionDHCPMessageType, 1, messageType,
 		}
 		if !requestedIP.IsUnspecified() {
-			options = append(options, OptionRequestedIPAddress, 4)
+			options = append(options, protocol.OptionRequestedIPAddress, 4)
 			options = append(options, requestedIP.To4()...)
 		}
 		if !serverIP.IsUnspecified() {
-			options = append(options, OptionServerIdentifier, 4)
+			options = append(options, protocol.OptionServerIdentifier, 4)
 			options = append(options, serverIP.To4()...)
 		}
-		return &Packet{
-			Op:      BOOTREQUEST,
+		return &protocol.Packet{
+			Op:      protocol.BOOTREQUEST,
 			HType:   1,
 			HLen:    6,
 			Hops:    0,
@@ -95,15 +96,15 @@ func TestHandleRequest(t *testing.T) {
 
 	testCases := []struct {
 		name            string
-		packet          *Packet
+		packet          *protocol.Packet
 		expectedState   int
 		expectResponse  bool
 		setup           func(*Server)
-		additionalCheck func(*testing.T, *Packet)
+		additionalCheck func(*testing.T, *protocol.Packet)
 	}{
 		{
 			name:           "SELECTING - Valid request",
-			packet:         createPacket(DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.100"), cfg.ServerIP),
+			packet:         createPacket(protocol.DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.100"), cfg.ServerIP),
 			expectedState:  SELECTING,
 			expectResponse: true,
 			setup: func(s *Server) {
@@ -113,21 +114,21 @@ func TestHandleRequest(t *testing.T) {
 					Expiration: time.Now().Add(time.Hour),
 				}
 			},
-			additionalCheck: func(t *testing.T, p *Packet) {
-				if p.DHCPMessageType() != DHCPACK {
+			additionalCheck: func(t *testing.T, p *protocol.Packet) {
+				if p.DHCPMessageType() != protocol.DHCPACK {
 					t.Errorf("Expected DHCPACK for valid SELECTING request")
 				}
 			},
 		},
 		{
 			name:           "SELECTING - Different server",
-			packet:         createPacket(DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.100"), net.ParseIP("192.168.1.3")),
+			packet:         createPacket(protocol.DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.100"), net.ParseIP("192.168.1.3")),
 			expectedState:  SELECTING,
 			expectResponse: false,
 		},
 		{
 			name:           "INIT_REBOOT - Valid request",
-			packet:         createPacket(DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.100"), net.IPv4zero),
+			packet:         createPacket(protocol.DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.100"), net.IPv4zero),
 			expectedState:  INIT_REBOOT,
 			expectResponse: true,
 			setup: func(s *Server) {
@@ -137,15 +138,15 @@ func TestHandleRequest(t *testing.T) {
 					Expiration: time.Now().Add(time.Hour),
 				}
 			},
-			additionalCheck: func(t *testing.T, p *Packet) {
-				if p.DHCPMessageType() != DHCPACK {
+			additionalCheck: func(t *testing.T, p *protocol.Packet) {
+				if p.DHCPMessageType() != protocol.DHCPACK {
 					t.Errorf("Expected DHCPACK for valid INIT_REBOOT request")
 				}
 			},
 		},
 		{
 			name:           "RENEWING - Valid request",
-			packet:         createPacket(DHCPREQUEST, net.ParseIP("192.168.1.100"), net.IPv4zero, net.IPv4zero),
+			packet:         createPacket(protocol.DHCPREQUEST, net.ParseIP("192.168.1.100"), net.IPv4zero, net.IPv4zero),
 			expectedState:  RENEWING,
 			expectResponse: true,
 			setup: func(s *Server) {
@@ -155,15 +156,15 @@ func TestHandleRequest(t *testing.T) {
 					Expiration: time.Now().Add(time.Hour),
 				}
 			},
-			additionalCheck: func(t *testing.T, p *Packet) {
-				if p.DHCPMessageType() != DHCPACK {
+			additionalCheck: func(t *testing.T, p *protocol.Packet) {
+				if p.DHCPMessageType() != protocol.DHCPACK {
 					t.Errorf("Expected DHCPACK for valid RENEWING request")
 				}
 			},
 		},
 		{
 			name:           "REBINDING - Valid request",
-			packet:         createPacket(DHCPREQUEST, net.ParseIP("192.168.1.100"), net.IPv4zero, net.IPv4zero),
+			packet:         createPacket(protocol.DHCPREQUEST, net.ParseIP("192.168.1.100"), net.IPv4zero, net.IPv4zero),
 			expectedState:  REBINDING,
 			expectResponse: true,
 			setup: func(s *Server) {
@@ -173,43 +174,43 @@ func TestHandleRequest(t *testing.T) {
 					Expiration: time.Now().Add(time.Hour),
 				}
 			},
-			additionalCheck: func(t *testing.T, p *Packet) {
-				if p.DHCPMessageType() != DHCPACK {
+			additionalCheck: func(t *testing.T, p *protocol.Packet) {
+				if p.DHCPMessageType() != protocol.DHCPACK {
 					t.Errorf("Expected DHCPACK for valid REBINDING request")
 				}
 			},
 		},
 		{
 			name:           "Invalid state",
-			packet:         createPacket(DHCPREQUEST, net.ParseIP("192.168.1.100"), net.ParseIP("192.168.1.100"), net.ParseIP("192.168.1.2")),
+			packet:         createPacket(protocol.DHCPREQUEST, net.ParseIP("192.168.1.100"), net.ParseIP("192.168.1.100"), net.ParseIP("192.168.1.2")),
 			expectedState:  -1,
 			expectResponse: false,
 		},
 		{
 			name:           "SELECTING - IP not in server pool",
-			packet:         createPacket(DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.2.100"), cfg.ServerIP),
+			packet:         createPacket(protocol.DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.2.100"), cfg.ServerIP),
 			expectedState:  SELECTING,
 			expectResponse: true,
-			additionalCheck: func(t *testing.T, p *Packet) {
-				if p.DHCPMessageType() != DHCPNAK {
+			additionalCheck: func(t *testing.T, p *protocol.Packet) {
+				if p.DHCPMessageType() != protocol.DHCPNAK {
 					t.Errorf("Expected DHCPNAK for IP not in server pool")
 				}
 			},
 		},
 		{
 			name:           "INIT_REBOOT - Unknown client",
-			packet:         createPacket(DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.150"), net.IPv4zero),
+			packet:         createPacket(protocol.DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.150"), net.IPv4zero),
 			expectedState:  INIT_REBOOT,
 			expectResponse: true,
-			additionalCheck: func(t *testing.T, p *Packet) {
-				if p.DHCPMessageType() != DHCPNAK {
+			additionalCheck: func(t *testing.T, p *protocol.Packet) {
+				if p.DHCPMessageType() != protocol.DHCPNAK {
 					t.Errorf("Expected DHCPNAK for unknown client in INIT_REBOOT")
 				}
 			},
 		},
 		{
 			name:           "RENEWING - Expired lease",
-			packet:         createPacket(DHCPREQUEST, net.ParseIP("192.168.1.100"), net.IPv4zero, net.IPv4zero),
+			packet:         createPacket(protocol.DHCPREQUEST, net.ParseIP("192.168.1.100"), net.IPv4zero, net.IPv4zero),
 			expectedState:  RENEWING,
 			expectResponse: true,
 			setup: func(s *Server) {
@@ -219,15 +220,15 @@ func TestHandleRequest(t *testing.T) {
 					Expiration: time.Now().Add(-time.Hour),
 				}
 			},
-			additionalCheck: func(t *testing.T, p *Packet) {
-				if p.DHCPMessageType() != DHCPNAK {
+			additionalCheck: func(t *testing.T, p *protocol.Packet) {
+				if p.DHCPMessageType() != protocol.DHCPNAK {
 					t.Errorf("Expected DHCPNAK for expired lease in RENEWING")
 				}
 			},
 		},
 		{
 			name:           "REBINDING - IP conflict",
-			packet:         createPacket(DHCPREQUEST, net.ParseIP("192.168.1.100"), net.IPv4zero, net.IPv4zero),
+			packet:         createPacket(protocol.DHCPREQUEST, net.ParseIP("192.168.1.100"), net.IPv4zero, net.IPv4zero),
 			expectedState:  REBINDING,
 			expectResponse: true,
 			setup: func(s *Server) {
@@ -237,15 +238,15 @@ func TestHandleRequest(t *testing.T) {
 					Expiration: time.Now().Add(time.Hour),
 				}
 			},
-			additionalCheck: func(t *testing.T, p *Packet) {
-				if p.DHCPMessageType() != DHCPNAK {
+			additionalCheck: func(t *testing.T, p *protocol.Packet) {
+				if p.DHCPMessageType() != protocol.DHCPNAK {
 					t.Errorf("Expected DHCPNAK for IP conflict in REBINDING")
 				}
 			},
 		},
 		{
 			name:           "SELECTING - Full IP pool",
-			packet:         createPacket(DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.150"), cfg.ServerIP),
+			packet:         createPacket(protocol.DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.150"), cfg.ServerIP),
 			expectedState:  SELECTING,
 			expectResponse: true,
 			setup: func(s *Server) {
@@ -258,15 +259,15 @@ func TestHandleRequest(t *testing.T) {
 					}
 				}
 			},
-			additionalCheck: func(t *testing.T, p *Packet) {
-				if p.DHCPMessageType() != DHCPNAK {
+			additionalCheck: func(t *testing.T, p *protocol.Packet) {
+				if p.DHCPMessageType() != protocol.DHCPNAK {
 					t.Errorf("Expected DHCPNAK when IP pool is full")
 				}
 			},
 		},
 		{
 			name:           "INIT_REBOOT - Requested IP doesn't match binding",
-			packet:         createPacket(DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.150"), net.IPv4zero),
+			packet:         createPacket(protocol.DHCPREQUEST, net.IPv4zero, net.ParseIP("192.168.1.150"), net.IPv4zero),
 			expectedState:  INIT_REBOOT,
 			expectResponse: true,
 			setup: func(s *Server) {
@@ -276,8 +277,8 @@ func TestHandleRequest(t *testing.T) {
 					Expiration: time.Now().Add(time.Hour),
 				}
 			},
-			additionalCheck: func(t *testing.T, p *Packet) {
-				if p.DHCPMessageType() != DHCPNAK {
+			additionalCheck: func(t *testing.T, p *protocol.Packet) {
+				if p.DHCPMessageType() != protocol.DHCPNAK {
 					t.Errorf("Expected DHCPNAK when requested IP doesn't match binding")
 				}
 			},

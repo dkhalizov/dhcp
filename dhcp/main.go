@@ -1,13 +1,13 @@
 package main
 
 import (
-	"dhcp/dhcp"
+	"dhcp/server"
 	"net"
 	"time"
 )
 
 func main() {
-	config := dhcp.Config{
+	config := server.Config{
 		Start:         net.IP{172, 20, 0, 10},
 		End:           net.IP{172, 20, 0, 20},
 		Subnet:        net.IPNet{IP: net.IP{172, 20, 0, 0}, Mask: net.IPMask{255, 255, 0, 0}},
@@ -19,9 +19,9 @@ func main() {
 		ServerIP:      net.IP{172, 20, 0, 2},
 		DomainName:    "DHCP TEST",
 	}
-	server, err := dhcp.NewServer(&config)
+	s, err := server.NewServer(&config)
 	if err != nil {
 		panic(err)
 	}
-	server.Run()
+	s.Run()
 }

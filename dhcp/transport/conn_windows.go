@@ -1,8 +1,9 @@
 //go:build windows
 
-package dhcp
+package transport
 
 import (
+	"dhcp/protocol"
 	"net"
 	"syscall"
 )
@@ -17,12 +18,12 @@ type EthernetHeader struct {
 	Proto       uint16
 }
 
-func (s *Server) Write(e *Ethernet) error {
+func Write(e *protocol.Ethernet) error {
 	_, err := s.conn.WriteTo(e.udp(), &net.UDPAddr{IP: e.DestinationIP, Port: 68})
 	return err
 }
 
-func (s *Server) buildConn() (net.PacketConn, error) {
+func buildConn() (net.PacketConn, error) {
 	conn, err := NewWinPacketConn()
 	if err != nil {
 		return nil, err

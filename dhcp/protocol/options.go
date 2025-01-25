@@ -1,10 +1,44 @@
-package options
+package protocol
+
+import (
+	"net"
+	"time"
+)
 
 type OptionInfo struct {
 	Name       string
 	DataLength string
 	Meaning    string
 }
+
+const (
+	// Commonly used DHCP options
+	OptionSubnetMask           byte = 1
+	OptionRouter                    = 3
+	OptionDomainNameServer          = 6
+	OptionHostname                  = 12
+	OptionDomainName                = 15
+	OptionBroadcastAddress          = 28
+	OptionNetworkTimeProtocol       = 42
+	OptionVendorSpecific            = 43
+	OptionRequestedIPAddress        = 50
+	OptionIPAddressLeaseTime        = 51
+	OptionDHCPMessageType           = 53
+	OptionServerIdentifier          = 54
+	OptionParameterRequestList      = 55
+	OptionRenewalTime               = 58
+	OptionRebindingTime             = 59
+	OptionClassIdentifier           = 60
+	OptionClientIdentifier          = 61
+	OptionTFTPServerName            = 66
+	OptionBootfileName              = 67
+	OptionUserClass                 = 77
+	OptionClientFQDN                = 81
+	OptionDHCPAgentOptions          = 82
+	OptionDomainSearch              = 119
+	OptionClasslessStaticRoute      = 121
+	OptionEnd                       = 255
+)
 
 var DHCPOptions = map[byte]OptionInfo{
 	0:   {"Pad", "0", "None"},
@@ -176,4 +210,15 @@ var DHCPOptions = map[byte]OptionInfo{
 	220: {"Subnet Allocation Option", "N", "Subnet Allocation Option"},            // Server needs to handle subnet allocation if used
 	221: {"Virtual Subnet Selection (VSS) Option", "", ""},                        // Server needs to handle virtual subnet selection if used
 	255: {"End", "0", "None"},
+}
+
+type ReplyOptions struct {
+	LeaseTime     time.Duration
+	RenewalTime   time.Duration
+	RebindingTime time.Duration
+	SubnetMask    net.IPMask
+	Router        net.IP
+	DNS           []net.IP
+	ServerIP      net.IP
+	DomainName    string
 }

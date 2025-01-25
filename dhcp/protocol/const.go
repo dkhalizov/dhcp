@@ -1,7 +1,9 @@
-package dhcp
+package protocol
 
 const (
-	// DHCP Message Types
+	BOOTREQUEST = 1
+	BOOTREPLY   = 2
+
 	DHCPDISCOVER = 1
 	DHCPOFFER    = 2
 	DHCPREQUEST  = 3
@@ -29,18 +31,4 @@ const (
 	//16	DHCPACTIVELEASEQUERY	[RFC7724]
 	//17	DHCPLEASEQUERYSTATUS	[RFC7724]
 	//18	DHCPTLS	[RFC7724]
-
-	// Hadware Types
-	ETHERNET     = 1
-	IEEE802      = 6
-	ARCNET       = 7
-	LOCALTALK    = 11
-	LocalNet     = 12
-	SMDS         = 14
-	FRAMERELAY   = 15
-	ATM          = 16
-	HDLC         = 17
-	FIBRECHANNEL = 18
-	ATM2         = 19
-	SERIALLINE   = 20
 )

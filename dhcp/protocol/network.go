@@ -1,9 +1,17 @@
-package dhcp
+package protocol
 
 import (
 	"encoding/binary"
 	"log/slog"
 	"net"
+)
+
+const (
+	ttlHeader        = 0xFF
+	udpProtocol      = 17
+	ethernetIPv4Type = 0x0800
+	clientPort       = 68
+	serverPort       = 67
 )
 
 type udp struct {
@@ -34,7 +42,7 @@ func (i *ipHeader) Encode() []byte {
 	data := make([]byte, 20)
 	data[0] = i.Version
 	binary.BigEndian.PutUint16(data[2:], i.Length)
-	data[8] = 0xFF // TTL
+	data[8] = ttlHeader
 	data[9] = i.Protocol
 	copy(data[12:16], i.Source.To4())
 	copy(data[16:20], i.Destination.To4())
@@ -82,7 +90,7 @@ func (p *Ethernet) Bytes() []byte {
 	h := ipHeader{
 		Version:     0x45, // IPv4
 		Length:      uint16(20 + len(UDP)),
-		Protocol:    17, // udp
+		Protocol:    udpProtocol, // udp
 		Source:      p.SourceIP,
 		Destination: p.DestinationIP,
 	}
@@ -92,7 +100,7 @@ func (p *Ethernet) Bytes() []byte {
 	e := ethernet{
 		Source:      p.SourceMAC,
 		Destination: p.DestinationMAC,
-		Type:        0x0800, // IPv4
+		Type:        ethernetIPv4Type,
 		Payload:     payload,
 	}
 	encode := e.Encode()
@@ -109,7 +117,7 @@ func (p *Ethernet) udp() []byte {
 	return u.Encode()
 }
 
-func (s *Server) sendPacket(p *Packet, sendAddr *net.UDPAddr) error {
+func SendPacket(conn net.PacketConn, p *Packet, sendAddr *net.UDPAddr) error {
 	isNak := p.GetOption(OptionDHCPMessageType)[0] == DHCPNAK
 
 	if p.GIAddr != nil && !p.GIAddr.IsUnspecified() {
@@ -117,16 +125,17 @@ func (s *Server) sendPacket(p *Packet, sendAddr *net.UDPAddr) error {
 			p.SetBroadcast()
 		} else {
 			// return to relay agent
-			sendAddr = &net.UDPAddr{IP: p.GIAddr, Port: 67}
+			sendAddr = &net.UDPAddr{IP: p.GIAddr, Port: serverPort}
 		}
 	} else if isNak {
 		// always broadcast NAK
-		sendAddr = &net.UDPAddr{IP: net.IPv4bcast, Port: 68}
+		sendAddr = &net.UDPAddr{IP: net.IPv4bcast, Port: clientPort}
 	} else if p.CIAddr != nil && !p.CIAddr.IsUnspecified() {
 		// send directly to client ip
-		sendAddr = &net.UDPAddr{IP: p.CIAddr, Port: 68}
+		sendAddr = &net.UDPAddr{IP: p.CIAddr, Port: clientPort}
 	} else if !p.IsBroadcast() && p.CHAddr != nil {
 		//unicast
+		//TODO
 	}
 
 	if sendAddr.IP.IsUnspecified() {
@@ -134,11 +143,11 @@ func (s *Server) sendPacket(p *Packet, sendAddr *net.UDPAddr) error {
 	}
 
 	encodedPacket := p.Encode()
-	_, err := s.conn.WriteTo(encodedPacket, sendAddr)
+	_, err := conn.WriteTo(encodedPacket, sendAddr)
 	if err != nil {
 		slog.Error("Failed to send DHCP packet", "error", err, "client", p.CHAddr, "offer_ip", p.CIAddr)
 	} else {
-		slog.Info("Sent DHCP packet", "client", p.CHAddr, "offer_ip", p.CIAddr)
+		slog.Info("Sent DHCP packet", "client", p.CHAddr.String(), "offer_ip", p.CIAddr.String())
 	}
 	return err
 }

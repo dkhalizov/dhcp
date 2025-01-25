@@ -1,4 +1,4 @@
-package dhcp
+package transport
 
 import (
 	"errors"
@@ -49,7 +49,7 @@ func getInterface() (*net.Interface, error) {
 	return iface, nil
 }
 
-func getMTU() (int, error) {
+func GetMTU() (int, error) {
 	iface, err := getInterface()
 	if err != nil {
 		return 0, err
