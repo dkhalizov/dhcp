@@ -21,7 +21,7 @@ const (
 	INIT_REBOOT
 	RENEWING
 	REBINDING
-
+	InvalidState         = -1
 	defaultMTU           = 1500
 	defaultReadTimeout   = 500 * time.Millisecond
 	leaseCleanupInterval = 1 * time.Minute
@@ -172,7 +172,7 @@ func (s *Server) startReadConn(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			_ = s.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			_ = s.conn.SetReadDeadline(time.Now().Add(defaultReadTimeout))
 			buf := bufPool.Get().([]byte)
 			n, addr, err := s.conn.ReadFrom(buf)
 			if err != nil {
@@ -230,6 +230,7 @@ func (s *Server) handleDiscover(packet *protocol.Packet, addr *net.UDPAddr) {
 	}
 	err := protocol.SendPacket(s.conn, offer, addr)
 	if err != nil {
+		s.releaseIP(offer.YIAddr)
 		slog.Error("Error sending offer", "error", err)
 	}
 }
@@ -244,12 +245,12 @@ func (s *Server) createOffer(packet *protocol.Packet) *protocol.Packet {
 	offer := packet.ToOffer(ip, s.createReplyOptions())
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.bindings[convertMACToUint64(packet.CHAddr)] = &binding{
+	s.bindings[MACToUint64(packet.CHAddr)] = &binding{
 		IP:         ip,
 		MAC:        packet.CHAddr,
 		Expiration: time.Now().Add(s.config.Lease),
 	}
-	s.allocated[convertIPToUint32(ip)] = true
+	s.allocated[IPToUint32(ip)] = true
 	slog.Info("Offering IP", "app", ip, "addr", packet.CHAddr.String())
 	return offer
 }
@@ -266,7 +267,7 @@ func (s *Server) releaseIP(ip net.IP) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ipUint := convertIPToUint32(ip)
+	ipUint := IPToUint32(ip)
 	if _, exists := s.allocated[ipUint]; exists {
 		delete(s.allocated, ipUint)
 		s.ipPool.Release(ip)
@@ -290,7 +291,7 @@ func (s *Server) setupListener() (*net.UDPConn, error) {
 }
 
 func (s *Server) cleanupExpiredLeases(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(leaseCleanupInterval)
 	defer ticker.Stop()
 
 	for {
@@ -341,7 +342,7 @@ func (s *Server) createAckOrNak(packet *protocol.Packet) *protocol.Packet {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	b, exists := s.bindings[convertMACToUint64(packet.CHAddr)]
+	b, exists := s.bindings[MACToUint64(packet.CHAddr)]
 	if !exists || !b.IP.Equal(packet.CIAddr) {
 		slog.Error("Invalid request", "packet", packet)
 		return packet.ToNak(s.createReplyOptions())
@@ -353,7 +354,7 @@ func (s *Server) createAckOrNak(packet *protocol.Packet) *protocol.Packet {
 }
 
 func (s *Server) handleRequest(packet *protocol.Packet, addr *net.UDPAddr) {
-	state := s.determineClientState(packet)
+	state := determineClientState(packet)
 	var response *protocol.Packet
 	switch state {
 	case SELECTING:
@@ -395,45 +396,55 @@ func (s *Server) handleRequest(packet *protocol.Packet, addr *net.UDPAddr) {
 }
 
 func (s *Server) buildResponseToBinding(packet *protocol.Packet, ip net.IP) (response *protocol.Packet) {
-	b, exists := s.bindings[convertMACToUint64(packet.CHAddr)]
-	if !exists || !b.IP.Equal(ip) {
-		response = packet.ToNak(s.createReplyOptions())
-	} else if b.Expiration.Before(time.Now()) {
-		response = packet.ToNak(s.createReplyOptions())
-	} else {
+	b, exists := s.bindings[MACToUint64(packet.CHAddr)]
+	isWrongBind := !exists || !b.IP.Equal(ip)
+	expiredBind := b.Expiration.Before(time.Now())
+
+	switch {
+	case isWrongBind:
+		return packet.ToNak(s.createReplyOptions())
+	case expiredBind:
+		return packet.ToNak(s.createReplyOptions())
+	default:
 		b.Expiration = time.Now().Add(s.config.Lease)
-		response = packet.ToAck(b.IP, s.createReplyOptions())
+		return packet.ToAck(b.IP, s.createReplyOptions())
 	}
-	return response
 }
 
-func (s *Server) determineClientState(packet *protocol.Packet) int {
-	emptyServer := packet.SIAddr == nil || packet.SIAddr.Equal(net.IPv4zero)
-	hasRequestedIP := packet.GetOption(protocol.OptionRequestedIPAddress) != nil && !net.IPv4zero.Equal(packet.GetOption(protocol.OptionServerIdentifier))
-	clientIPIsZero := packet.CIAddr.Equal(net.IPv4zero)
+func isZeroIP(ip net.IP) bool {
+	return ip == nil || ip.Equal(net.IPv4zero)
+}
 
-	if !emptyServer && hasRequestedIP && clientIPIsZero {
+func determineClientState(packet *protocol.Packet) int {
+	if packet == nil {
+		return InvalidState
+	}
+
+	emptyServer := isZeroIP(packet.SIAddr)
+	hasRequestedIP := packet.GetOption(protocol.OptionRequestedIPAddress) != nil
+	clientIPZero := isZeroIP(packet.CIAddr)
+	isBroadcast := packet.IsBroadcast()
+
+	switch {
+	case !emptyServer && hasRequestedIP && clientIPZero:
 		return SELECTING
-	}
-
-	if emptyServer && hasRequestedIP && clientIPIsZero {
+	case emptyServer && hasRequestedIP && clientIPZero:
 		return INIT_REBOOT
-	}
-
-	if emptyServer && !clientIPIsZero {
-		if packet.IsBroadcast() {
+	case emptyServer && !clientIPZero:
+		if isBroadcast {
 			return REBINDING
 		}
 		return RENEWING
+	default:
+		slog.Warn("Unexpected packet state", "SIAddr", packet.SIAddr, "CIAddr", packet.CIAddr, "HasRequestedIP", hasRequestedIP)
+		return InvalidState
 	}
-	return -1
 }
-
-func convertMACToUint64(mac net.HardwareAddr) uint64 {
+func MACToUint64(mac net.HardwareAddr) uint64 {
 	return uint64(mac[0])<<40 | uint64(mac[1])<<32 | uint64(mac[2])<<24 | uint64(mac[3])<<16 | uint64(mac[4])<<8 | uint64(mac[5])
 }
 
-func convertIPToUint32(ip net.IP) uint32 {
+func IPToUint32(ip net.IP) uint32 {
 	ip = ip.To4()
 	if ip == nil {
 		return 0

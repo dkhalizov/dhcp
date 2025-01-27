@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 )
@@ -118,36 +120,63 @@ func (p *Ethernet) udp() []byte {
 }
 
 func SendPacket(conn net.PacketConn, p *Packet, sendAddr *net.UDPAddr) error {
-	isNak := p.GetOption(OptionDHCPMessageType)[0] == DHCPNAK
-
-	if p.GIAddr != nil && !p.GIAddr.IsUnspecified() {
-		if isNak {
-			p.SetBroadcast()
-		} else {
-			// return to relay agent
-			sendAddr = &net.UDPAddr{IP: p.GIAddr, Port: serverPort}
-		}
-	} else if isNak {
-		// always broadcast NAK
-		sendAddr = &net.UDPAddr{IP: net.IPv4bcast, Port: clientPort}
-	} else if p.CIAddr != nil && !p.CIAddr.IsUnspecified() {
-		// send directly to client ip
-		sendAddr = &net.UDPAddr{IP: p.CIAddr, Port: clientPort}
-	} else if !p.IsBroadcast() && p.CHAddr != nil {
-		//unicast
-		//TODO
+	if conn == nil || p == nil {
+		return errors.New("conn and packet must not be nil")
 	}
 
-	if sendAddr.IP.IsUnspecified() {
-		sendAddr.IP = net.IPv4bcast
+	destAddr, err := resolveDestinationAddress(p, sendAddr)
+	if err != nil {
+		return fmt.Errorf("failed to resolve destination address: %w", err)
 	}
 
 	encodedPacket := p.Encode()
-	_, err := conn.WriteTo(encodedPacket, sendAddr)
+
+	_, err = conn.WriteTo(encodedPacket, destAddr)
 	if err != nil {
-		slog.Error("Failed to send DHCP packet", "error", err, "client", p.CHAddr, "offer_ip", p.CIAddr)
-	} else {
-		slog.Info("Sent DHCP packet", "client", p.CHAddr.String(), "offer_ip", p.CIAddr.String())
+		slog.Error("Failed to send DHCP packet",
+			"error", err,
+			"client", p.CHAddr,
+			"offer_ip", p.CIAddr,
+			"destination", destAddr,
+		)
+		return fmt.Errorf("failed to send packet: %w", err)
 	}
-	return err
+
+	slog.Debug("Sent DHCP packet",
+		"client", p.CHAddr.String(),
+		"offer_ip", p.CIAddr.String(),
+		"destination", destAddr,
+	)
+	return nil
+}
+func resolveDestinationAddress(p *Packet, sendAddr *net.UDPAddr) (net.Addr, error) {
+	if p.IsBroadcast() {
+		return &net.UDPAddr{IP: net.IPv4bcast, Port: clientPort}, nil
+	}
+
+	if len(p.GetOption(OptionDHCPMessageType)) > 0 && p.GetOption(OptionDHCPMessageType)[0] == DHCPNAK {
+		return &net.UDPAddr{IP: net.IPv4bcast, Port: clientPort}, nil
+	}
+
+	// If GIAddr is specified and not zero, send to the relay agent
+	if p.GIAddr != nil && !p.GIAddr.IsUnspecified() {
+		return &net.UDPAddr{IP: p.GIAddr, Port: serverPort}, nil
+	}
+
+	// Send directly to the client's IP if specified
+	if p.CIAddr != nil && !p.CIAddr.IsUnspecified() {
+		return &net.UDPAddr{IP: p.CIAddr, Port: clientPort}, nil
+	}
+
+	// Handle unicast
+	if p.CHAddr != nil {
+		//TODO
+	}
+
+	// Default to broadcast
+	if sendAddr == nil || sendAddr.IP.IsUnspecified() {
+		return &net.UDPAddr{IP: net.IPv4bcast, Port: clientPort}, nil
+	}
+
+	return sendAddr, nil
 }

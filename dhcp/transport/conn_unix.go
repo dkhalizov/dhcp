@@ -3,22 +3,46 @@
 package transport
 
 import (
-	"dhcp/protocol"
 	"fmt"
 	"net"
 	"os"
 	"syscall"
+	"time"
 )
 
-func Write(conn net.PacketConn, e *protocol.Ethernet, addr net.Addr) error {
-	_, err := conn.WriteTo(e.Bytes(), addr)
-	if err != nil {
-		return err
-	}
-	return nil
+type UnixTransport struct {
+	conn net.PacketConn
 }
 
-func buildConn() (net.PacketConn, error) {
+func (t *UnixTransport) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	return t.conn.WriteTo(p, addr)
+}
+
+func (t *UnixTransport) Close() error {
+	return t.conn.Close()
+}
+
+func (t *UnixTransport) LocalAddr() net.Addr {
+	return t.conn.LocalAddr()
+}
+
+func (t *UnixTransport) SetDeadline(dt time.Time) error {
+	return t.conn.SetDeadline(dt)
+}
+
+func (t *UnixTransport) SetReadDeadline(dt time.Time) error {
+	return t.conn.SetReadDeadline(dt)
+}
+
+func (t *UnixTransport) SetWriteDeadline(dt time.Time) error {
+	return t.conn.SetWriteDeadline(dt)
+}
+
+func (t *UnixTransport) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	return t.conn.ReadFrom(p)
+}
+
+func BuildConn() (*UnixTransport, error) {
 	iface, err := getInterface()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get interface: %v", err)
@@ -47,7 +71,9 @@ func buildConn() (net.PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return conn, nil
+	return &UnixTransport{
+		conn: conn,
+	}, nil
 }
 
 func htons(host uint16) uint16 {

@@ -108,7 +108,7 @@ func TestHandleRequest(t *testing.T) {
 			expectedState:  SELECTING,
 			expectResponse: true,
 			setup: func(s *Server) {
-				s.bindings[convertMACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
+				s.bindings[MACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
 					IP:         net.ParseIP("192.168.1.100"),
 					MAC:        net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
 					Expiration: time.Now().Add(time.Hour),
@@ -132,7 +132,7 @@ func TestHandleRequest(t *testing.T) {
 			expectedState:  INIT_REBOOT,
 			expectResponse: true,
 			setup: func(s *Server) {
-				s.bindings[convertMACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
+				s.bindings[MACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
 					IP:         net.ParseIP("192.168.1.100"),
 					MAC:        net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
 					Expiration: time.Now().Add(time.Hour),
@@ -150,7 +150,7 @@ func TestHandleRequest(t *testing.T) {
 			expectedState:  RENEWING,
 			expectResponse: true,
 			setup: func(s *Server) {
-				s.bindings[convertMACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
+				s.bindings[MACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
 					IP:         net.ParseIP("192.168.1.100"),
 					MAC:        net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
 					Expiration: time.Now().Add(time.Hour),
@@ -168,7 +168,7 @@ func TestHandleRequest(t *testing.T) {
 			expectedState:  REBINDING,
 			expectResponse: true,
 			setup: func(s *Server) {
-				s.bindings[convertMACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
+				s.bindings[MACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
 					IP:         net.ParseIP("192.168.1.100"),
 					MAC:        net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
 					Expiration: time.Now().Add(time.Hour),
@@ -214,7 +214,7 @@ func TestHandleRequest(t *testing.T) {
 			expectedState:  RENEWING,
 			expectResponse: true,
 			setup: func(s *Server) {
-				s.bindings[convertMACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
+				s.bindings[MACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
 					IP:         net.ParseIP("192.168.1.100"),
 					MAC:        net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
 					Expiration: time.Now().Add(-time.Hour),
@@ -232,7 +232,7 @@ func TestHandleRequest(t *testing.T) {
 			expectedState:  REBINDING,
 			expectResponse: true,
 			setup: func(s *Server) {
-				s.bindings[convertMACToUint64(net.HardwareAddr{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})] = &binding{
+				s.bindings[MACToUint64(net.HardwareAddr{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})] = &binding{
 					IP:         net.ParseIP("192.168.1.100"),
 					MAC:        net.HardwareAddr{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
 					Expiration: time.Now().Add(time.Hour),
@@ -271,7 +271,7 @@ func TestHandleRequest(t *testing.T) {
 			expectedState:  INIT_REBOOT,
 			expectResponse: true,
 			setup: func(s *Server) {
-				s.bindings[convertMACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
+				s.bindings[MACToUint64(net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})] = &binding{
 					IP:         net.ParseIP("192.168.1.100"), // Different from requested IP
 					MAC:        net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
 					Expiration: time.Now().Add(time.Hour),
